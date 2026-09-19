@@ -1,0 +1,90 @@
+# ============================================================
+# 全部阈值参数（第七章 默认参数表 + 第八章 监控阈值 + 第四章 评分）
+# 铁律 P05：禁止在代码中硬编码阈值，一律从此文件读取。
+# ============================================================
+
+chemistry:
+  LFP:
+    v_full: 91.25        # 25S x 3.65V
+    v_cutoff: 65.0       # 25S x 2.6V
+    alpha: 0.005         # 温度系数 /°C
+    t_ref: 25.0          # 参考温度 °C
+    cell_v_full: 3.65
+    cell_v_cutoff: 2.6
+  NMC:
+    v_full: 88.2         # 21S x 4.2V
+    v_cutoff: 63.0       # 21S x 3.0V
+    alpha: 0.0025
+    t_ref: 25.0
+    cell_v_full: 4.2
+    cell_v_cutoff: 3.0
+
+filter:
+  temp_range: [5.0, 45.0]          # 温度过滤区间（超出标记 temp_out）
+  temp_normal_range: [15.0, 35.0]  # 评分"温度正常"区间
+  cap_range_ratio: [0.65, 1.10]    # 容量合理区间（相对 C_nom_BMS，超界标记 out_of_range 降权）
+  cap_anomaly_ratio: [0.50, 1.20]  # 容量越界（异常标记）
+  cap_normal_ratio: [0.75, 1.00]   # 评分"容量正常"区间
+
+anchor:
+  soc_full: 0.95            # A. 满充末端 SOC 阈值
+  soc_swap_full: 0.98       # B. 站内满充完成 SOC 阈值
+  soc_empty: 0.10           # C. 放空末端 SOC 阈值
+  v_full_ratio: 0.99        # V > V_full x 0.99
+  v_cutoff_ratio: 1.05      # V < V_cutoff x 1.05
+  full_current_max_a: 5.0   # 满充末端涓流上限（0 < I < 该值）
+  rest_c_rate: 0.02         # 静置判据 |I| < 0.02C
+  duration_hours: 2.0       # 持续性要求 >= 2h
+  gap_hours: 6.0            # 断档容忍
+  deadband_a: 0.2           # 电流死区
+  sensor_drift_a: 2.0       # 电流零点偏移 > 2A 标记传感器漂移
+  current_zero_frac_limit: 0.90  # |I|<1A 占比 > 90% 则电流字段实质缺失
+  current_near_zero_a: 1.0
+
+quality:
+  score:                    # 4b 评分项（锚点类型基础分 + 各加扣分）
+    SWAP_FULL: 20
+    EMPTY_END: 20
+    FULL_END: 15
+    OCV: 10
+    temp_normal: 5
+    temp_out: -10
+    cap_normal: 10
+    cap_anomaly: -20
+    v_normal: 10
+    v_anomaly: -15
+    contradiction: -15
+    sensor_drift: -10
+  tier1_min: 30             # Tier-1: 评分 >= 30 且无严重异常
+  tier2_min: 10             # Tier-2: 评分 10~29
+  severe_flags: [out_of_range, voltage_inconsistent, anchor_conflict, contradiction]
+  weight:                   # Step5 加权中位数权重
+    SWAP_FULL: 1.0
+    EMPTY_END: 1.0
+    FULL_END: 0.8
+    OCV: 0.5
+  tier2_weight: 0.3         # Tier-2 观察权重
+  contradiction_ratio: 0.30 # 前后矛盾：与相邻锚点容量差异 > 30%
+
+soh:
+  mad_window: 7             # 去毛刺窗口（5~9）
+  mad_threshold: 3.0        # 3 x MAD
+  monthly_drop_alert: 0.05  # 单设备 SOH 月跌幅 > 5% 告警
+
+retirement:
+  soh_retire: 0.80          # SOH < 80% 视为退役线
+  health_levels: [0.85, 0.75, 0.65]
+  min_months: 3             # 回归至少需要的月数
+  r2_min: 0.6               # R^2 低于此值预测仅供参考
+  ci_z: 1.96                # 95% 置信区间
+
+monitoring:
+  device_anchor_rate_min: 0.20      # 设备级有效锚点率 < 20% → 标记"数据不足"
+  channel_anchor_rate_min: 0.30     # 渠道级锚点率 < 30% → 系统性故障告警
+  channel_anchor_rate_drop_mom: 0.30  # 环比跌 > 30% → 告警
+
+selfcheck:
+  r_cv_dynamic: 0.02        # R 的 CV < 2% 且无趋势 → CONSTANT
+  r_slope_eps: 0.0005       # 归一化斜率绝对值小于此视为无趋势
+  neg_loopnum_frac: 0.01    # 循环次数负增量占比 > 1% → 改用时间窗口分组
+  min_anchor_per_month: 3   # R_MODE=CONSTANT 时每月锚点数 >= 3 仍走锚点法

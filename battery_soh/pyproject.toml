@@ -1,0 +1,26 @@
+[project]
+name = "battery-soh"
+version = "0.1.0"
+description = "换电电池 SOH 估算工程管线（锚点法 + 质量分级 + 月度聚合 + 退役预测）"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=1.0",
+    "pyarrow>=15.0",
+    "pyyaml>=6.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = [
+    "ignore::polars.exceptions.DataOrientationWarning",
+]
+
+[tool.setuptools]
+packages = ["src"]
