@@ -13,14 +13,21 @@ import polars as pl
 from .schema import RAW_SCHEMA, enforce_schema, validate_raw_schema
 
 
-def scan_raw(path: str) -> pl.LazyFrame:
-    """流式扫描原始 parquet（不物化），强制 schema。"""
+def scan_raw(path: str, device_filter: str | None = None) -> pl.LazyFrame:
+    """流式扫描原始 parquet（不物化），强制 schema；可按设备清单 inner-join 过滤。
+
+    注意：不做跨文件去重——由 prep.py 分片时统一去重（data/filtered/ 已去重）。
+    """
     if os.path.isdir(path):
         lf = pl.scan_parquet(os.path.join(path, "*.parquet"))
     else:
         lf = pl.scan_parquet(path)
     validate_raw_schema(lf.collect_schema())
-    return enforce_schema(lf, RAW_SCHEMA)
+    lf = enforce_schema(lf, RAW_SCHEMA)
+    if device_filter and os.path.exists(device_filter):
+        dm = pl.read_csv(device_filter)
+        lf = lf.join(dm.lazy().select("电池id"), on="电池id", how="inner")
+    return lf
 
 
 def iter_device_batches(
@@ -30,7 +37,12 @@ def iter_device_batches(
     devices = lf.select("电池id").unique().sort("电池id").collect()["电池id"].to_list()
     for i in range(0, len(devices), batch_devices):
         chunk = devices[i : i + batch_devices]
-        yield lf.filter(pl.col("电池id").is_in(chunk)).collect()
+        yield (
+            lf.filter(pl.col("电池id").is_in(chunk))
+            .unique(subset=["电池id", "更新时间"], keep="first")
+            .sort(["电池id", "更新时间"])
+            .collect()
+        )
 
 
 def write_partitioned(

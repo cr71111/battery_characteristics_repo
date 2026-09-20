@@ -1,8 +1,10 @@
 """Step 6 设备级时序处理（Reduce 阶段，方案 5-Step6）。
 
 6a 滚动 MAD 去毛刺：窗口 7（5~9），阈值 3×MAD，自适应（禁止固定阈值，P07）。
+   仅对月内锚点数 >= 2 的月份生效；单锚点月直接保留（稀疏数据不做抹平）。
 6b PAVA 单调回归：O(n)，强制非增（电池容量只降不升），保趋势不过度平滑。
-6c SOH = C_smoothed / C_nom_BMS（C_nom 取设备级首年稳健中位数，禁止规格书，P04）。
+6c SOH = C_smoothed / C_nom_spec（分母=规格书标称容量 c_nom_spec，绝对口径，
+   跨设备可比；用户 2026-09 决定改用规格书 37Ah，替代原"设备首年容量中位数"相对口径）。
 """
 from __future__ import annotations
 
@@ -61,24 +63,37 @@ def pava_decreasing(y: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
 def run(monthly: pl.DataFrame, cfg: Config) -> pl.DataFrame:
     win = cfg.get("soh.mad_window")
     k = cfg.get("soh.mad_threshold")
-    first_year = int(monthly["year"].min())
+    c_nom_spec = float(cfg.get("c_nom_spec") or 37.0)  # 绝对口径分母
+    low = float(cfg.get("exclude.soh_low_ratio") or 0.90)
 
     out_chunks = []
+    n_trimmed = 0
     for (ch, dev), sub in monthly.group_by(["渠道号", "电池id"], maintain_order=True):
         sub = sub.sort("ym")
         cap = sub["capacity_median"].to_numpy()
+        # 6-pre 前导异常月剔除：头 k 个月 SOH < low 而后续中位 >= low →
+        # 初期校准噪声（换BMS新ID首月偏低、次月恢复），在平滑前删除，
+        # 否则 PAVA 非增会把整条曲线拉低。整段都低的设备留给 step7 判换BMS。
+        soh_pre = cap / c_nom_spec
+        kk = 0
+        while kk < len(cap) and np.isfinite(soh_pre[kk]) and soh_pre[kk] < low:
+            kk += 1
+        if 0 < kk < len(cap) and float(np.median(soh_pre[kk:])) >= low:
+            n_trimmed += kk
+            sub = sub.slice(kk)
+            cap = cap[kk:]
         w = np.maximum(sub["capacity_count"].to_numpy().astype(float), 1.0)
-        # 6a 去毛刺：离群点用窗口中位数替换
-        mask = mad_outlier_mask(cap, win, k)
+        # 6a 去毛刺：仅月内锚点数>=2 的月份参与判定，单锚点月直接保留
+        n_anchor = sub["capacity_count"].to_numpy()
+        mask = mad_outlier_mask(cap, win, k) & (n_anchor >= 2)
         cap_clean = cap.copy()
         if mask.any():
             rep = mad_replacements(cap, mask, win)
             cap_clean[mask] = rep[mask]
         # 6b PAVA 非增
         cap_smooth = pava_decreasing(cap_clean, w)
-        # 6c SOH：首年中位数作 C_nom
-        fy = sub["year"].to_numpy() == first_year
-        denom = np.median(cap_clean[fy]) if fy.any() and np.isfinite(cap_clean[fy]).any() else np.median(cap_clean)
+        # 6c SOH = 平滑容量 / 规格书标称容量（绝对口径）
+        denom = c_nom_spec
         soh = cap_smooth / denom if denom > 0 else np.full(len(cap_smooth), np.nan)
         soh_raw = cap / denom if denom > 0 else np.full(len(cap), np.nan)
         out_chunks.append(
@@ -90,7 +105,10 @@ def run(monthly: pl.DataFrame, cfg: Config) -> pl.DataFrame:
                 pl.Series("c_nom_soh", [float(denom)] * len(cap)),
             )
         )
-    return pl.concat(out_chunks).sort(["渠道号", "电池id", "ym"]) if out_chunks else monthly.clear()
+    result = pl.concat(out_chunks).sort(["渠道号", "电池id", "ym"]) if out_chunks else monthly.clear()
+    if n_trimmed:
+        print(f"[step6] 前导异常月剔除 {n_trimmed} 个月点（SOH<{low:.0%} 且后续恢复）")
+    return result
 
 
 def mad_replacements(values: np.ndarray, mask: np.ndarray, window: int) -> np.ndarray:

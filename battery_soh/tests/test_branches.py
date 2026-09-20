@@ -13,7 +13,7 @@ def _constant_r_raw(n_devices: int = 2, n_rows: int = 300, seed: int = 2) -> pl.
     t0 = np.datetime64("2024-03-01T00:00:00")
     k = 0
     for d in range(n_devices):
-        dev = 11000001 + d
+        dev = 11000000 + d * 25  # 命中 Step0 抽样（电池id % 25 == 0）
         for _ in range(n_rows):
             t = t0 + np.timedelta64(k, "m")
             k += 60
@@ -45,7 +45,7 @@ def _dynamic_r_raw(n_devices: int = 1, n_rows: int = 300, seed: int = 3) -> pl.D
     t0 = np.datetime64("2024-03-01T00:00:00")
     k = 0
     for d in range(n_devices):
-        dev = 11000001 + d
+        dev = 11000000 + d * 25  # 命中 Step0 抽样
         for j in range(n_rows):
             t = t0 + np.timedelta64(k, "m")
             k += 60
@@ -112,7 +112,7 @@ def test_pipeline_skips_when_not_absolute(cfg):
     from src.pipeline import Pipeline
 
     p = Pipeline(_branch_cfg(cfg, route="L2_TREND"), dry_run=True)
-    assert p.steps_1_4() is None
+    assert p.steps_1_5() is None
 
 
 def test_config_fail_fast():

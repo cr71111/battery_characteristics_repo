@@ -4,6 +4,9 @@
   output/profile/diagnosis_report.json   七张体检结论
   output/profile/config.generated.yaml   实测体系参数（供三段配置合并）
   output/profile/device_list_valid.csv   设备级 C_nom_BMS + 有效性
+
+大数据量（亿级行）策略：设备级 Python 循环用哈希抽样（约 4%），
+全量聚合（C_nom / 密度）走 polars streaming。
 """
 from __future__ import annotations
 
@@ -19,15 +22,25 @@ from .io import scan_raw
 
 SERIES_CANDIDATES = {"LFP": [24, 25], "NMC": [20, 21]}
 PLATFORM_SLOPE_LFP_MAX = 0.03  # V/cell 每单位 SOC；平台区低于此 → LFP
+SAMPLE_MOD = 25  # 设备抽样：电池id % 25 == 0（约 4%）
+
+
+def _sampled(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return lf.filter(pl.col("电池id") % SAMPLE_MOD == 0)
+
+
+def _collect(lf: pl.LazyFrame) -> pl.DataFrame:
+    return lf.collect(engine="streaming")
 
 
 def _r_stats(lf: pl.LazyFrame) -> dict:
-    """1. R 有效性：R=剩余容量/SOC 按设备的 CV 与斜率。"""
-    df = (
-        lf.filter((pl.col("SOC") > 0.05) & (pl.col("剩余容量") > 0))
+    """1. R 有效性：R=剩余容量/SOC 按设备的 CV 与斜率（抽样设备）。"""
+    df = _collect(
+        _sampled(lf)
+        .filter((pl.col("SOC") > 0.05) & (pl.col("剩余容量") > 0))
         .with_columns((pl.col("剩余容量") / pl.col("SOC")).alias("R"))
         .sort(["电池id", "更新时间"])
-        .collect()
+        .select(["电池id", "更新时间", "R"])
     )
     rows = []
     for (dev,), sub in df.group_by("电池id", maintain_order=True):
@@ -39,7 +52,9 @@ def _r_stats(lf: pl.LazyFrame) -> dict:
         m = np.isfinite(t) & np.isfinite(r)
         slope = float(np.polyfit(t[m], r[m], 1)[0]) if m.sum() >= 12 else 0.0
         rows.append((dev, cv, slope, float(np.nanmedian(r))))
-    st = pl.DataFrame(rows, schema=["电池id", "cv", "slope", "r_med"], orient="row")
+    st = pl.DataFrame(rows, schema={"电池id": pl.Int64, "cv": pl.Float64,
+                                    "slope": pl.Float64, "r_med": pl.Float64},
+                      orient="row")
     med_cv = float(st["cv"].median()) if st.height else 1.0
     med_slope = float(st["slope"].median()) if st.height else 0.0
     return {
@@ -52,9 +67,10 @@ def _r_stats(lf: pl.LazyFrame) -> dict:
 
 def _chemistry(lf: pl.LazyFrame) -> dict:
     """2. 体系判别：平台区 dV/dSOC 斜率（长平台=LFP，单调斜线=NMC）+ 串数。"""
-    d = (
-        lf.filter((pl.col("SOC") >= 0.2) & (pl.col("SOC") <= 0.8) & pl.col("电流").abs().lt(1.0))
-        .select(["电池id", "SOC", "电压"]).collect()
+    d = _collect(
+        _sampled(lf)
+        .filter((pl.col("SOC") >= 0.2) & (pl.col("SOC") <= 0.8) & pl.col("电流").abs().lt(1.0))
+        .select(["电池id", "SOC", "电压"])
     )
     slopes = []
     for (dev,), sub in d.group_by("电池id", maintain_order=True):
@@ -64,10 +80,10 @@ def _chemistry(lf: pl.LazyFrame) -> dict:
     med_slope = float(np.median(slopes)) if slopes else 0.0
     chem = "LFP" if med_slope < PLATFORM_SLOPE_LFP_MAX * 25 else "NMC"
     # 串数：满充电压/单体满充、放空电压/单体截止 取最接近的候选串数
-    lim = (
-        lf.group_by("电池id")
+    lim = _collect(
+        _sampled(lf)
+        .group_by("电池id")
         .agg(pl.col("电压").max().alias("vmax"), pl.col("电压").min().alias("vmin"))
-        .collect()
     )
     cell = {"LFP": (3.65, 2.60), "NMC": (4.20, 3.00)}[chem]
     best, best_err = None, 1e9
@@ -89,11 +105,12 @@ def _chemistry(lf: pl.LazyFrame) -> dict:
 
 
 def _sampling(lf: pl.LazyFrame) -> dict:
-    """3. 真实采样间隔分布。"""
-    d = (
-        lf.sort(["电池id", "更新时间"])
+    """3. 真实采样间隔分布（抽样设备）。"""
+    d = _collect(
+        _sampled(lf)
+        .sort(["电池id", "更新时间"])
         .with_columns(pl.col("更新时间").diff().over("电池id").dt.total_minutes().alias("gap"))
-        .filter(pl.col("gap") > 0).select("gap").collect()
+        .filter(pl.col("gap") > 0).select("gap")
     )
     q = list(d["gap"].quantile([0.05, 0.25, 0.5, 0.75, 0.95]))
     return {
@@ -104,20 +121,22 @@ def _sampling(lf: pl.LazyFrame) -> dict:
 
 
 def _loopnum(lf: pl.LazyFrame, thr: float) -> dict:
-    """4. 循环次数单调性。"""
-    d = (
-        lf.sort(["电池id", "更新时间"])
+    """4. 循环次数单调性（抽样设备）。"""
+    d = _collect(
+        _sampled(lf)
+        .sort(["电池id", "更新时间"])
         .with_columns(pl.col("循环次数").diff().over("电池id").alias("dl"))
-        .filter(pl.col("dl").is_not_null()).select("dl").collect()
+        .filter(pl.col("dl").is_not_null()).select("dl")
     )
     neg = float((d["dl"] < 0).mean()) if d.height else 0.0
     return {"neg_frac": round(neg, 5), "use_time_window": neg > thr}
 
 
 def _current_sign(lf: pl.LazyFrame) -> dict:
-    """5. 电流符号抽检：SOC 明显上升段 I 应恒正。"""
-    d = (
-        lf.sort(["电池id", "更新时间"])
+    """5. 电流符号抽检：SOC 明显上升段 I 应恒正（抽样设备）。"""
+    d = _collect(
+        _sampled(lf)
+        .sort(["电池id", "更新时间"])
         .with_columns(
             pl.col("SOC").diff().over("电池id").alias("dsoc"),
             pl.col("电流").rolling_mean(3).over("电池id").alias("i3"),
@@ -129,7 +148,7 @@ def _current_sign(lf: pl.LazyFrame) -> dict:
             (pl.col("i3") < 0).mean().alias("neg_frac"),
             pl.len().alias("n"),
         )
-        .filter(pl.col("n") >= 20).collect()
+        .filter(pl.col("n") >= 20)
     )
     if d.height == 0:
         return {"checked_devices": 0, "reversed_devices": [], "note": "无 SOC 上升样本可检"}
@@ -144,13 +163,16 @@ def _current_sign(lf: pl.LazyFrame) -> dict:
 def _current_zero(lf: pl.LazyFrame, thr: float, near: float) -> dict:
     """6. 电流零点分布：|I|<1A 占比 >90% → 电流字段实质缺失（第一优先级）。"""
     frac = float(
-        lf.select(pl.col("电流").abs().lt(near).mean()).collect().item()
+        _collect(_sampled(lf).select(pl.col("电流").abs().lt(near).mean())).item()
     )
     return {"near_zero_frac": round(frac, 4), "current_effectively_missing": frac > thr}
 
 
 def _c_nom(lf: pl.LazyFrame) -> pl.DataFrame:
-    """4 章 P04：C_nom_BMS = 设备级 R 众数（0.5Ah 分箱取最密箱中值），非规格书猜测。"""
+    """4 章 P04：C_nom_BMS = 设备级 R 众数（0.5Ah 分箱取最密箱中值），非规格书猜测。
+
+    全量设备（streaming 聚合，供 Step 3 join）。
+    """
     df = (
         lf.filter((pl.col("SOC") > 0.05) & (pl.col("剩余容量") > 0))
         .with_columns(
@@ -170,19 +192,20 @@ def _c_nom(lf: pl.LazyFrame) -> pl.DataFrame:
         lf.group_by(["渠道号", "电池id"])
         .agg(pl.col("更新时间").min().alias("t0"), pl.col("更新时间").max().alias("t1"))
     )
-    return df.join(span, on=["渠道号", "电池id"], how="left").collect()
+    return df.join(span, on=["渠道号", "电池id"], how="left").collect(engine="streaming")
 
 
 def _anchor_density(lf: pl.LazyFrame, v_full: float, v_cutoff: float) -> dict:
-    """CONSTANT 分支用：粗略锚点候选密度（每月每设备）。"""
-    d = (
-        lf.filter(
+    """CONSTANT 分支用：粗略锚点候选密度（每月每设备，抽样设备）。"""
+    d = _collect(
+        _sampled(lf)
+        .filter(
             (pl.col("SOC") >= 0.98)
             | ((pl.col("SOC") < 0.10) & (pl.col("电压") < v_cutoff * 1.05))
             | ((pl.col("SOC") > 0.95) & (pl.col("电压") > v_full * 0.99))
         )
         .with_columns(pl.col("更新时间").dt.strftime("%Y-%m").alias("ym"))
-        .group_by(["电池id", "ym"]).agg(pl.len().alias("n")).collect()
+        .group_by(["电池id", "ym"]).agg(pl.len().alias("n"))
     )
     months = d.height
     return {

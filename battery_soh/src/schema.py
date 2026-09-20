@@ -65,12 +65,14 @@ def validate_ocv_table(df: pl.DataFrame) -> None:
 
 
 def enforce_schema(df: pl.DataFrame, schema: dict[str, pl.DataType]) -> pl.DataFrame:
-    """强制列 dtype（缺失列补 null，多余列保留但告警由调用方处理）。"""
-    exprs = []
+    """强制列 dtype（缺失列补 null），并保留 schema 之外的额外列（如 电池型号）。"""
     cols = df.collect_schema().names() if isinstance(df, pl.LazyFrame) else df.columns
+    exprs = []
     for name, dtype in schema.items():
         if name in cols:
             exprs.append(pl.col(name).cast(dtype, strict=False))
         else:
             exprs.append(pl.lit(None, dtype=dtype).alias(name))
+    extra = [c for c in cols if c not in schema]
+    exprs = [pl.col(c) for c in extra] + exprs
     return df.select(exprs)

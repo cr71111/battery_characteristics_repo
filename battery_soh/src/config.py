@@ -71,6 +71,27 @@ class Config:
         return p
 
     @property
+    def device_filter_path(self) -> str | None:
+        """设备过滤清单 CSV（含 电池id[, 电池型号]）；未配置或不存在返回 None。"""
+        p = self.get("device_filter")
+        if not p:
+            return None
+        if not os.path.isabs(p):
+            p = os.path.normpath(os.path.join(self.base_dir, p))
+        return p if os.path.exists(p) else None
+
+    @property
+    def model_map(self) -> "pl.DataFrame | None":
+        """电池id → 电池型号 映射（用于按型号分类聚合）。"""
+        p = self.device_filter_path
+        if p is None:
+            return None
+        dm = pl.read_csv(p)
+        if "电池型号" not in dm.columns:
+            return None
+        return dm.select(["电池id", "电池型号"]).unique()
+
+    @property
     def chemistry(self) -> str:
         return self.get("generated.chemistry") or self.get("chemistry") or "LFP"
 

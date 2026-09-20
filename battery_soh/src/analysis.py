@@ -105,14 +105,19 @@ def selfcheck_group_consistency(soh_monthly: pl.DataFrame) -> pl.DataFrame:
 
 # ---------------------------------------------------------------- 渠道看板
 def channel_dashboard(
-    anchors: pl.DataFrame, soh_monthly: pl.DataFrame, decay: pl.DataFrame
+    anchors: "pl.DataFrame | pl.LazyFrame", soh_monthly: pl.DataFrame, decay: pl.DataFrame
 ) -> pl.DataFrame:
-    """渠道级看板（方案 5-Step8）：有效锚点率、中位衰退速率、锚点率环比。"""
-    total = anchors.group_by("渠道号").agg(pl.len().alias("anchor_total"))
+    """渠道级看板（方案 5-Step8）：有效锚点率、中位衰退速率、锚点率环比。
+
+    anchors 可为 LazyFrame（亿级行）：聚合结果均为渠道×月量级，streaming 收集。
+    """
+    al = anchors.lazy() if isinstance(anchors, pl.LazyFrame) else anchors.lazy()
+    total = al.group_by("渠道号").agg(pl.len().alias("anchor_total")).collect(engine="streaming")
     t1 = (
-        anchors.filter(pl.col("cap_tier") == 1)
+        al.filter(pl.col("cap_tier") == 1)
         .group_by("渠道号")
         .agg(pl.len().alias("tier1_count"))
+        .collect(engine="streaming")
     )
     dash = total.join(t1, on="渠道号", how="left").with_columns(
         (pl.col("tier1_count") / pl.col("anchor_total")).fill_null(0.0).alias("anchor_rate")
@@ -125,7 +130,7 @@ def channel_dashboard(
         dash = dash.join(med, on="渠道号", how="left")
     # 锚点率环比（按月）
     monthly = (
-        anchors.with_columns(pl.col("更新时间").dt.strftime("%Y-%m").alias("ym"))
+        al.with_columns(pl.col("更新时间").dt.strftime("%Y-%m").alias("ym"))
         .group_by(["渠道号", "ym"])
         .agg(
             pl.len().alias("n"),
@@ -139,6 +144,7 @@ def channel_dashboard(
         .filter(pl.col("rate_mom_drop") < 0)
         .group_by("渠道号")
         .agg(pl.col("rate_mom_drop").min().alias("worst_mom_drop"))
+        .collect(engine="streaming")
     )
     dash = dash.join(monthly, on="渠道号", how="left")
     return dash.sort("渠道号")

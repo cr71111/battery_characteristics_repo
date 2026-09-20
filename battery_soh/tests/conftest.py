@@ -30,8 +30,21 @@ def ocv_v(soc: float) -> float:
 
 
 @pytest.fixture(scope="session")
-def cfg():
-    return load_config()
+def cfg(tmp_path_factory):
+    """固定 21S 体系（与合成数据一致），避免真实数据 Step 0 覆写 generated 配置干扰测试。"""
+    import yaml
+
+    g = tmp_path_factory.mktemp("gen") / "config.generated.yaml"
+    g.write_text(
+        yaml.safe_dump(
+            {"chemistry": "NMC", "series": 21, "R_MODE": "DYNAMIC", "route": "ABSOLUTE",
+             "v_full": 88.2, "v_cutoff": 63.0,
+             "reversed_devices": [], "current_effectively_missing": False},
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    return load_config(generated_path=str(g))
 
 
 def make_raw(n_devices: int = 3, n_cycles: int = 12, seed: int = 0) -> pl.DataFrame:

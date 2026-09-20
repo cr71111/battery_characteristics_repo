@@ -1,6 +1,7 @@
 """端到端管线测试（小数据，输出重定向到 tmp_path）。"""
 from __future__ import annotations
 
+import glob
 import os
 
 import polars as pl
@@ -11,10 +12,11 @@ from conftest import make_raw
 
 @pytest.fixture()
 def cfg_env(cfg, tmp_path, monkeypatch):
-    """写合成 parquet + 重定向各模块 OUTPUT_DIR。"""
+    """写合成 parquet 分片 + 重定向各模块 OUTPUT_DIR。"""
     raw = make_raw(n_devices=3, n_cycles=12)
-    data_p = tmp_path / "raw.parquet"
-    raw.write_parquet(str(data_p))
+    data_dir = tmp_path / "filtered"
+    data_dir.mkdir()
+    raw.write_parquet(str(data_dir / "part_00.parquet"))
 
     import src.pipeline as pipeline
     import src.step3_capacity as step3
@@ -25,9 +27,12 @@ def cfg_env(cfg, tmp_path, monkeypatch):
     out = str(tmp_path / "output")
     monkeypatch.setattr(pipeline, "OUTPUT_DIR", out)
     monkeypatch.setattr(pipeline, "OBS_DIR", os.path.join(out, "observation"))
+    monkeypatch.setattr(pipeline, "MONTHLY_DIR", os.path.join(out, "monthly"))
     monkeypatch.setattr(step5, "OUTPUT_DIR", out)
     monkeypatch.setattr(step7, "OUTPUT_DIR", out)
     monkeypatch.setattr(step8, "OUTPUT_DIR", out)
+    import src.report_model as report_model
+    monkeypatch.setattr(report_model, "OUTPUT_DIR", out)
     monkeypatch.setattr(
         step3, "load_c_nom",
         lambda c: pl.DataFrame(
@@ -39,8 +44,16 @@ def cfg_env(cfg, tmp_path, monkeypatch):
         ),
     )
     c = cfg
-    c._cfg["data_path"] = str(data_p)
+    c._cfg["data_path"] = str(data_dir)
+    # 合成数据标称 40Ah：对齐 SOH 分母、关闭低 SOH 剔除策略（由真实数据验证）
+    c._cfg["c_nom_spec"] = 40.0
+    c._cfg.setdefault("exclude", {})["soh_low_ratio"] = 0.001
     return c, out
+
+
+def _read_parts(d: str) -> pl.DataFrame:
+    files = sorted(glob.glob(os.path.join(d, "*.parquet")))
+    return pl.concat([pl.read_parquet(f) for f in files])
 
 
 def test_full_pipeline(cfg_env):
@@ -50,7 +63,7 @@ def test_full_pipeline(cfg_env):
     p = Pipeline(c)
     p.run(from_step=1, to_step=8)
 
-    obs = pl.read_parquet(os.path.join(out, "observation", "anchor_points.parquet"))
+    obs = _read_parts(os.path.join(out, "observation", "parts"))
     monthly = pl.read_parquet(os.path.join(out, "monthly", "monthly_capacity.parquet"))
     analysis = pl.read_parquet(os.path.join(out, "soh", "soh_analysis.parquet"))
     retire = pl.read_parquet(os.path.join(out, "retirement", "retirement_forecast.parquet"))
@@ -68,16 +81,16 @@ def test_full_pipeline(cfg_env):
 
 
 def test_resume_skips_done(cfg_env):
-    """断点续传：第二次跑 Step1~4 不新增设备。"""
+    """断点续传：第二次跑 Step1~5 不新增设备。"""
     c, out = cfg_env
     from src.pipeline import Pipeline
 
     p = Pipeline(c)
-    p.run(from_step=1, to_step=4)
-    first = pl.read_parquet(os.path.join(out, "observation", "anchor_points.parquet")).height
+    p.run(from_step=1, to_step=5)
+    first = _read_parts(os.path.join(out, "observation", "parts")).height
     p2 = Pipeline(c)
-    p2.run(from_step=1, to_step=4)
-    second = pl.read_parquet(os.path.join(out, "observation", "anchor_points.parquet")).height
+    p2.run(from_step=1, to_step=5)
+    second = _read_parts(os.path.join(out, "observation", "parts")).height
     assert first == second
 
 
@@ -85,5 +98,5 @@ def test_dry_run_writes_nothing(cfg_env):
     c, out = cfg_env
     from src.pipeline import Pipeline
 
-    Pipeline(c, dry_run=True).run(from_step=1, to_step=4)
-    assert not os.path.exists(os.path.join(out, "observation", "anchor_points.parquet"))
+    Pipeline(c, dry_run=True).run(from_step=1, to_step=5)
+    assert not os.path.exists(os.path.join(out, "observation", "parts", "anchor_b0000.parquet"))

@@ -50,22 +50,16 @@ def run(df: pl.DataFrame, cfg: Config) -> pl.DataFrame:
         dt = np.diff(t, prepend=t[0])  # 距上一行的秒差
         # 静置判据：|I| < 0.02C，且与上一行间隔 <= 断档容忍（否则持续性中断）
         rest = (np.abs(i) < rest_i) & valid & ((dt <= gap_s) | (np.arange(n) == 0))
-        # 持续 >= 2h：以"向前累计静置时长"实现（稀疏采样下按时间轴累计，不要求逐行连续）
-        rest_dur = np.zeros(n)
-        acc = 0.0
-        prev_t = None
-        for k in range(n):
-            if rest[k]:
-                if prev_t is not None and (t[k] - prev_t) <= gap_s:
-                    acc += t[k] - prev_t
-                else:
-                    acc = 0.0
-                rest_dur[k] = acc
-                prev_t = t[k]
-            else:
-                acc = 0.0
-                prev_t = None
+        # 持续 >= 2h：向前累计静置时长（向量化：连续静置段内累加 dt，段首归零）
+        cont = rest & np.concatenate(([False], rest[:-1])) & (dt <= gap_s)
+        cadd = np.cumsum(np.where(cont, dt, 0.0))
+        run_start = rest & ~cont
+        base = np.where(run_start, cadd, -np.inf)
+        rest_dur = np.where(rest, cadd - np.maximum.accumulate(base), 0.0)
         long_rest = rest_dur >= dur_s
+        # 方案要求"取静置段末行"：仅每段最后一行标 OCV（下一行非静置/断档/数据末尾）
+        next_rest = np.concatenate((rest[1:], [False]))
+        seg_end = long_rest & ~next_rest
 
         # A. 满充末端：SOC>0.95 且 V>V_full*0.99 且 0<I<涓流上限 且持续>=2h（涓流段用静置近似）
         cond_a = (
@@ -85,7 +79,7 @@ def run(df: pl.DataFrame, cfg: Config) -> pl.DataFrame:
         # C. 放空末端：SOC<0.10 且 V<V_cutoff*1.05 且 I<0
         cond_c = (soc < a["soc_empty"]) & (v < v_cutoff * a["v_cutoff_ratio"]) & (i < 0) & valid
         # D. 静置 OCV：|I|<0.02C 持续>=2h（取静置段末行），SOC_anchor 由电压查表
-        cond_d = long_rest & valid
+        cond_d = seg_end & valid
 
         conflict = ((cond_a.astype(int) + cond_b.astype(int) + cond_c.astype(int) + cond_d.astype(int)) > 1)
         atype = np.full(n, "NONE", dtype=object)
@@ -114,7 +108,10 @@ def run(df: pl.DataFrame, cfg: Config) -> pl.DataFrame:
         for k in np.where(sub["invalid_sensor"].to_numpy())[0]:
             flags[k].append("invalid_sensor")
 
-        chunk = sub.select(["电池id", "渠道号", "更新时间", "循环次数", "剩余容量", "SOC", "电压", "电流", "温度"]).with_columns(
+        base_cols = [c for c in sub.columns
+                     if c not in ("invalid_loopnum", "invalid_sensor", "current_reversed",
+                                  "current_sensor_drift", "time_gap")]
+        chunk = sub.select(base_cols).with_columns(
             pl.Series("anchor_type", atype),
             pl.Series("soc_anchor", soc_anchor),
             pl.Series("flags", flags, dtype=pl.List(pl.Utf8)),

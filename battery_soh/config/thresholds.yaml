@@ -70,6 +70,13 @@ soh:
   mad_window: 7             # 去毛刺窗口（5~9）
   mad_threshold: 3.0        # 3 x MAD
   monthly_drop_alert: 0.05  # 单设备 SOH 月跌幅 > 5% 告警
+  min_anchors_per_month: 3  # 月内有效锚点数 < 3 → 该月不产出月度点（单锚点不足以代表整月）
+  anchor_mad_k: 3.0         # 月内锚点级去毛刺：|x-中位| > k*1.4826*MAD 的锚点剔除
+
+exclude:                    # 低 SOH 处理策略（阈值 soh_low_ratio 驱动两处逻辑）
+  soh_low_ratio: 0.90       # ① step6：前 k 月 SOH<90% 而后续恢复 → 只删前导异常月，设备保留
+                            # ② step7：全部可靠月（>=2）SOH<90% → 疑似旧电池换BMS，整台剔除
+                            #    （单独出 excluded_devices.csv；其余设备一律保留）
 
 retirement:
   soh_retire: 0.80          # SOH < 80% 视为退役线

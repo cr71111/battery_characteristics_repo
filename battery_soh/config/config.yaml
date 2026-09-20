@@ -4,8 +4,16 @@
 # 用途：人工覆盖体系参数、指定数据路径等。留空即完全采用默认值。
 # ============================================================
 
-# 原始数据路径（相对项目根目录或绝对路径）；留空则用 data/raw/ 下全部 parquet
-data_path: "../2024年数据.parquet"
+# 原始数据路径（相对项目根目录或绝对路径）；目录则读取全部 parquet
+source_path: "data"
+# 预处理后的分桶数据目录（prep 生成；管线实际读取此目录）
+data_path: "data/filtered"
+
+# 设备过滤清单（只计算其中的电池id；留空则全量）
+device_filter: "device_model/device_model.csv"
+
+# 设备标称容量（报告基准；管线内部仍用 Step 0 实测 C_nom，P04）
+c_nom_spec: 37.0
 
 # 人工指定体系（留空则由 Step 0 自动判别）：LFP / NMC
 # chemistry: LFP
