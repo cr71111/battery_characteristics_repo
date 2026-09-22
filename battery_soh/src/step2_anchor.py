@@ -26,16 +26,18 @@ def _soc_from_ocv(v_cell: np.ndarray, soc_axis: np.ndarray, ocv_axis: np.ndarray
     return np.interp(v_cell, ocv_axis, soc_axis)
 
 
-def run(df: pl.DataFrame, cfg: Config) -> pl.DataFrame:
+def run(df: pl.DataFrame, cfg: Config, params: dict | None = None) -> pl.DataFrame:
     a = cfg.get("anchor")
-    v_full = cfg.get("generated.v_full") or cfg.chem_params()["v_full"]
-    v_cutoff = cfg.get("generated.v_cutoff") or cfg.chem_params()["v_cutoff"]
-    series = cfg.series
-    c_nom_default = cfg.get("generated.c_nom_default") or 40.0
+    p = params or {}
+    v_full = p.get("v_full") or cfg.get("generated.v_full") or cfg.chem_params()["v_full"]
+    v_cutoff = p.get("v_cutoff") or cfg.get("generated.v_cutoff") or cfg.chem_params()["v_cutoff"]
+    series = p.get("series") or cfg.series
+    chemistry = p.get("chemistry")
+    c_nom_default = p.get("c_nom_spec") or cfg.get("generated.c_nom_default") or 40.0
     rest_i = cfg.get("anchor.rest_c_rate") * c_nom_default  # |I| < 0.02C
     dur_s = a["duration_hours"] * 3600.0
     gap_s = a["gap_hours"] * 3600.0
-    soc_axis, ocv_axis = _ocv_lookup(cfg.ocv_table())
+    soc_axis, ocv_axis = _ocv_lookup(cfg.ocv_table(chemistry, series))
 
     df = df.sort(["电池id", "更新时间"])
     out_chunks = []

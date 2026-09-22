@@ -24,9 +24,11 @@ def load_c_nom(cfg: Config) -> pl.DataFrame:
     return pl.read_csv(path).select(["渠道号", "电池id", "c_nom_bms"])
 
 
-def run(anchors: pl.DataFrame, c_nom: pl.DataFrame, cfg: Config) -> pl.DataFrame:
-    p = cfg.chem_params()
-    alpha, t_ref = p["alpha"], p["t_ref"]
+def run(anchors: pl.DataFrame, c_nom: pl.DataFrame, cfg: Config, params: dict | None = None) -> pl.DataFrame:
+    cp = cfg.chem_params()
+    mp = params or {}
+    alpha = mp.get("alpha", cp["alpha"])
+    t_ref = mp.get("t_ref", cp["t_ref"])
     lo, hi = cfg.get("filter.cap_range_ratio")
     tlo, thi = cfg.get("filter.temp_range")
 
@@ -50,14 +52,16 @@ def run(anchors: pl.DataFrame, c_nom: pl.DataFrame, cfg: Config) -> pl.DataFrame
         .then(pl.lit(True)).otherwise(pl.lit(False)).alias("temp_out"),
     )
     # v_inconsistent：放空端电压仍在平台区 / 满充端电压偏低（用单体电压粗校验）
-    series = cfg.series
+    series = mp.get("series") or cfg.series
+    cell_v_cutoff = mp.get("cell_v_cutoff", cp["cell_v_cutoff"])
+    cell_v_full = mp.get("cell_v_full", cp["cell_v_full"])
     anchor = anchor.with_columns(
         pl.when(
             ((pl.col("anchor_type") == "EMPTY_END")
-             & (pl.col("电压") / series > p["cell_v_cutoff"] * 1.25))
+             & (pl.col("电压") / series > cell_v_cutoff * 1.25))
             | (
                 (pl.col("anchor_type") == "FULL_END")
-                & (pl.col("电压") / series < p["cell_v_full"] * 0.9)
+                & (pl.col("电压") / series < cell_v_full * 0.9)
             )
         )
         .then(pl.lit(True)).otherwise(pl.lit(False)).alias("v_inconsistent"),

@@ -92,6 +92,47 @@ class Config:
         return dm.select(["电池id", "电池型号"]).unique()
 
     @property
+    def channels(self) -> list[str]:
+        """允许的渠道号白名单（空 = 不过滤）。"""
+        return list(self.get("channels") or [])
+
+    @property
+    def model_params(self) -> dict:
+        """电池型号 → 体系参数（来自 device_model/电池参数.csv，优先于 Step 0 判别）。
+
+        每项：chemistry / series / c_nom_spec / v_full / v_cutoff /
+        cell_v_full / cell_v_cutoff / alpha / t_ref。
+        """
+        p = self.get("model_params_path")
+        if not p:
+            return {}
+        if not os.path.isabs(p):
+            p = os.path.normpath(os.path.join(self.base_dir, p))
+        if not os.path.exists(p):
+            return {}
+        df = pl.read_csv(p)
+        out: dict[str, dict] = {}
+        for r in df.iter_rows(named=True):
+            chem = {"铁锂": "LFP", "三元": "NMC"}.get(str(r.get("电池类型", "")).strip(), "LFP")
+            cp = self._cfg.get("chemistry", {}).get(chem, {})
+            series = int(r["电芯数量"])
+            cap = float(str(r["标称容量"]).lower().replace("ah", "").strip())
+            cell_v_full = float(r["单电芯满称电压"])
+            cell_v_cutoff = float(cp.get("cell_v_cutoff", 2.6 if chem == "LFP" else 3.0))
+            out[str(r["电池型号"]).strip()] = {
+                "chemistry": chem,
+                "series": series,
+                "c_nom_spec": cap,
+                "v_full": float(r["电池合计满充电压"]),
+                "v_cutoff": round(series * cell_v_cutoff, 2),
+                "cell_v_full": cell_v_full,
+                "cell_v_cutoff": cell_v_cutoff,
+                "alpha": float(cp.get("alpha", 0.005)),
+                "t_ref": float(cp.get("t_ref", 25.0)),
+            }
+        return out
+
+    @property
     def chemistry(self) -> str:
         return self.get("generated.chemistry") or self.get("chemistry") or "LFP"
 

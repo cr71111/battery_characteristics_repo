@@ -33,6 +33,8 @@ def cfg_env(cfg, tmp_path, monkeypatch):
     monkeypatch.setattr(step8, "OUTPUT_DIR", out)
     import src.report_model as report_model
     monkeypatch.setattr(report_model, "OUTPUT_DIR", out)
+    import src.report_forecast as report_forecast
+    monkeypatch.setattr(report_forecast, "OUTPUT_DIR", out)
     monkeypatch.setattr(
         step3, "load_c_nom",
         lambda c: pl.DataFrame(
@@ -45,8 +47,10 @@ def cfg_env(cfg, tmp_path, monkeypatch):
     )
     c = cfg
     c._cfg["data_path"] = str(data_dir)
-    # 合成数据标称 40Ah：对齐 SOH 分母、关闭低 SOH 剔除策略（由真实数据验证）
+    # 合成数据标称 40Ah：对齐 SOH 分母、关闭低 SOH 剔除策略（由真实数据验证）；
+    # 禁用真实型号参数表（合成设备 id 与 device_model.csv 撞号）
     c._cfg["c_nom_spec"] = 40.0
+    c._cfg["model_params_path"] = None
     c._cfg.setdefault("exclude", {})["soh_low_ratio"] = 0.001
     return c, out
 
@@ -73,7 +77,7 @@ def test_full_pipeline(cfg_env):
     assert monthly.height > 0
     assert {"soh", "decay_rate_pct_month"} <= set(analysis.columns)
     assert retire.height == 3
-    assert os.path.exists(os.path.join(out, "reports", "dashboard.html"))
+    assert os.path.exists(os.path.join(out, "reports", "总体", "dashboard.html"))
     # SOH 从 ~1.0 缓降（合成 fade 0.05/循环 → 12 循环约 -1.5%）
     last = analysis.sort(["电池id", "ym"]).group_by("电池id", maintain_order=True).last()
     assert (last["soh"] > 0.9).all()

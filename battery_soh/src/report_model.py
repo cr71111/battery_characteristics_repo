@@ -1,10 +1,11 @@
 """按电池型号分类的 SOH 趋势报告（device_model.csv 的 电池型号 维度）。
 
 输入：output/soh/soh_analysis.parquet（设备×月 SOH）+ config.device_filter（id→型号映射）
-输出：
-  output/reports/model_trend.csv        型号×月 中位 SOH / P10 / P90 / 设备数
-  output/reports/model_decay_stats.csv  型号级衰退速率分布（中位/四分位）+ 相对标称 37Ah 的容量水平
-  output/reports/model_soh_trend.png    两型号 SOH 趋势对比图
+输出（多型号目录结构）：
+  output/reports/总体/model_trend.csv        型号×月 中位 SOH / P10 / P90 / 设备数
+  output/reports/总体/model_decay_stats.csv  型号级衰退速率分布（中位/四分位）
+  output/reports/总体/model_soh_*.png        跨型号对比图（日历月/月龄/循环）
+  output/reports/<型号>/*.png|csv            单型号趋势图 + 型号级 CSV
 """
 from __future__ import annotations
 
@@ -17,6 +18,27 @@ from .config import OUTPUT_DIR, Config
 
 C_NOM_SPEC_FALLBACK = 37.0
 
+# 型号配色（固定顺序，跨图一致；未知型号按调色板轮询）
+_MODEL_ORDER = ["四美7237", "海池7237", "半固态6054", "海池4840", "海池4846", "鼎山7240"]
+_PALETTE = ["#d62728", "#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
+            "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+def model_color(model: str) -> str:
+    """型号 → 颜色。已知型号用固定色，未知型号轮询调色板。"""
+    try:
+        return _PALETTE[_MODEL_ORDER.index(str(model))]
+    except ValueError:
+        return _PALETTE[abs(hash(str(model))) % len(_PALETTE)]
+
+
+def _cap_expr(df: pl.DataFrame, c_nom_spec: float):
+    """capacity_ah 聚合表达式：优先逐设备分母列 c_nom_soh（逐型号标称），
+    否则回退全局标称 c_nom_spec。"""
+    if "c_nom_soh" in df.columns:
+        return pl.col("soh").median() * pl.col("c_nom_soh").median()
+    return pl.col("soh").median() * c_nom_spec
+
 
 def model_trend(analysis: pl.DataFrame, model_map: pl.DataFrame, c_nom_spec: float) -> pl.DataFrame:
     """型号×月 聚合：SOH 分位数 + 设备数 + 容量（SOH×标称）+ 累计循环次数。"""
@@ -26,7 +48,7 @@ def model_trend(analysis: pl.DataFrame, model_map: pl.DataFrame, c_nom_spec: flo
         pl.col("soh").quantile(0.10).alias("soh_p10"),
         pl.col("soh").quantile(0.90).alias("soh_p90"),
         pl.col("电池id").n_unique().alias("device_count"),
-        (pl.col("soh").median() * c_nom_spec).alias("capacity_ah"),
+        _cap_expr(df, c_nom_spec).alias("capacity_ah"),
     ]
     if "loop_median" in df.columns:  # 该月全部设备累计循环次数（BMS 值）
         aggs += [pl.col("loop_median").median().alias("loop_median"),
@@ -86,7 +108,7 @@ def model_age_trend(analysis: pl.DataFrame, model_map: pl.DataFrame, c_nom_spec:
         pl.col("soh").quantile(0.10).alias("soh_p10"),
         pl.col("soh").quantile(0.90).alias("soh_p90"),
         pl.col("电池id").n_unique().alias("device_count"),
-        (pl.col("soh").median() * c_nom_spec).alias("capacity_ah"),
+        _cap_expr(df, c_nom_spec).alias("capacity_ah"),
         # 该月龄组设备的出厂年月（首条记录月）与循环次数分布（P25~P75），供横轴标注
         pl.col("birth_mi").quantile(0.25).alias("birth_p25"),
         pl.col("birth_mi").quantile(0.75).alias("birth_p75"),
@@ -120,7 +142,7 @@ def model_loop_trend(analysis: pl.DataFrame, model_map: pl.DataFrame,
             pl.col("soh").quantile(0.10).alias("soh_p10"),
             pl.col("soh").quantile(0.90).alias("soh_p90"),
             pl.col("电池id").n_unique().alias("device_count"),
-            (pl.col("soh").median() * c_nom_spec).alias("capacity_ah"),
+            _cap_expr(df, c_nom_spec).alias("capacity_ah"),
             # 该循环档设备的月龄与出厂年月（首条记录月）分布（P25~P75），供横轴标注
             pl.col("age_month").quantile(0.25).alias("age_p25"),
             pl.col("age_month").quantile(0.75).alias("age_p75"),
@@ -179,13 +201,13 @@ def caption_trend() -> str:
         "反映“当前这批在役电池整体状态如何”，适合做运维监控与退役规划。\n"
         "实线=当月在线设备 SOH 中位数，阴影带=P10~P90 区间；虚线（右轴）=当月参与统计的设备数，每季度首月标注数值；\n"
         "顶部横轴=BMS 累计循环次数（每 100 次一刻度，颜色同型号）。解读注意：各电池出厂/上线时间不同，每月设备群体本身\n"
-        "在变化（新电池上线会抬高快照），本图两型号的“最新 SOH 高低”混入了机龄构成差异，公平对比请看“SOH-月龄曲线”。"
+        "在变化（新电池上线会抬高快照），本图各型号的“最新 SOH 高低”混入了机龄构成差异，公平对比请看“SOH-月龄曲线”。"
     )
 
 
-def caption_single_trend(model: str) -> str:
+def caption_single_trend(model: str, desc: str = "", c_nom: float = 37.0) -> str:
     return (
-        f"【图说明】{model}（铁锂 24S，标称 37Ah）。横轴为自然年月：每个点统计“该月在线且有锚点数据的全部该型号设备”\n"
+        f"【图说明】{model}（{desc or '铁锂 24S'}，标称 {c_nom:g}Ah）。横轴为自然年月：每个点统计“该月在线且有锚点数据的全部该型号设备”\n"
         "的 SOH 分布，是全部设备在某一时点的健康快照，反映“当前这批在役电池整体状态如何”，适合做运维监控与退役规划。\n"
         "实线=当月在线设备 SOH 中位数，阴影带=P10~P90 区间；虚线（右轴）=当月参与统计的设备数，每季度首月标注数值；\n"
         "顶部横轴=BMS 累计循环次数（每 100 次一刻度）；点状竖线=中位 SOH 跌破 80% 处。解读注意：各电池出厂/上线时间不同，\n"
@@ -193,27 +215,26 @@ def caption_single_trend(model: str) -> str:
     )
 
 
-def caption_age() -> str:
+def caption_age(c_nom: float = 37.0) -> str:
     return (
         "【图说明】横轴为“上线月龄”：每台电池以自身出现首条数据的月份为第 0 个月，所有设备对齐到同一起点后按月龄分组统计，\n"
-        "消除了各电池出厂/上线时间不同带来的机龄差异，是两型号公平对比衰退快慢的口径。\n"
+        "消除了各电池出厂/上线时间不同带来的机龄差异，是各型号公平对比衰退快慢的口径。\n"
         "实线=该月龄所有设备 SOH 中位数，阴影带=P10~P90 区间（90% 设备落在带内）；虚线（右轴）=该月龄参与统计的设备数；\n"
         "点状竖线+标签=中位 SOH 跌破 80% 的月龄。循环次数维度请看独立的“SOH-循环次数曲线”图（两轴交点不同属正常：\n"
-        "日历老化+分组构成差异）。横轴刻度下四行（一二行四美、三四行海池）：该组设备累计循环次数 P25~P75 ／ 出厂年月（首条记录月）P25~P75。\n"
-        "SOH 以规格书标称 37Ah 为分母（绝对口径）；已剔除疑似旧电池换BMS设备（整段低容量），初期月份异常的设备仅剔除异常前导月（见 excluded_devices.csv）。\n"
-        "解读注意：月龄越大剩余设备越少（海池 12 月龄后、四美 20 月龄后设备数骤降），尾部曲线由少数长寿命设备构成且\n"
-        "区间变宽，代表性下降，建议以设备数仍在千台以上的区段为准。"
+        "日历老化+分组构成差异）。横轴刻度下每型号两行：该组设备累计循环次数 P25~P75 ／ 出厂年月（首条记录月）P25~P75。\n"
+        f"SOH 以各型号规格书标称容量为分母（绝对口径）；已剔除疑似旧电池换BMS设备（整段低容量），初期月份异常的设备仅剔除异常前导月（见 excluded_devices.csv）。\n"
+        "解读注意：月龄越大剩余设备越少，尾部曲线由少数长寿命设备构成且区间变宽，代表性下降，建议以设备数较多的区段为准。"
     )
 
 
-def caption_single_age(model: str) -> str:
+def caption_single_age(model: str, desc: str = "", c_nom: float = 37.0) -> str:
     return (
-        f"【图说明】{model}（铁锂 24S，标称 37Ah）。横轴为“上线月龄”：每台电池以自身出现首条数据的月份为第 0 个月，\n"
+        f"【图说明】{model}（{desc or '铁锂 24S'}，标称 {c_nom:g}Ah）。横轴为“上线月龄”：每台电池以自身出现首条数据的月份为第 0 个月，\n"
         "所有设备对齐到同一起点后按月龄分组统计，消除了各电池出厂/上线时间不同带来的机龄差异，\n"
         "反映该型号自身随使用时间的衰退规律。实线=该月龄所有设备 SOH 中位数，阴影带=P10~P90 区间（90% 设备落在带内）；\n"
         "虚线（右轴）=该月龄参与统计的设备数；点状竖线=中位 SOH 跌破 80% 的月龄。循环次数维度请看独立的“SOH-循环次数曲线”图。\n"
         "横轴刻度下两行：该月龄组设备累计循环次数 P25~P75 ／ 出厂年月（首条记录月）P25~P75。\n"
-        "SOH 以规格书标称 37Ah 为分母（绝对口径）；已剔除疑似换BMS设备，初期月份异常仅删异常前导月。月龄越大剩余设备越少，尾部代表性下降，建议以设备数千台以上区段为准。"
+        f"SOH 以规格书标称 {c_nom:g}Ah 为分母（绝对口径）；已剔除疑似换BMS设备，初期月份异常仅删异常前导月。月龄越大剩余设备越少，尾部代表性下降，建议以设备数较多区段为准。"
     )
 
 
@@ -223,14 +244,14 @@ def caption_loop() -> str:
         "归档后取中位数。与“月龄曲线”按时间对齐不同，本图按“用了多少循环”对齐，反映同等循环消耗下的容量保持能力，\n"
         "可剥离使用强度（换电频次）差异。实线=SOH 中位数，阴影带=P10~P90；虚线（右轴）=落入该循环档的设备数；\n"
         "点状竖线+标签=中位 SOH 跌破 80% 的循环次数。时间维度请看独立的“SOH-月龄曲线”图（两轴 80% 交点不同属正常）。\n"
-        "横轴刻度下四行（一二行四美、三四行海池）：该循环档设备月龄 P25~P75 ／ 出厂年月（首条记录月）P25~P75。\n"
+        "横轴刻度下每型号两行：该循环档设备月龄 P25~P75 ／ 出厂年月（首条记录月）P25~P75。\n"
         "解读注意：高循环档样本少（虚线低），且能达到高循环的设备本身使用强度高，尾部曲线代表性下降。"
     )
 
 
-def caption_single_loop(model: str) -> str:
+def caption_single_loop(model: str, desc: str = "", c_nom: float = 37.0) -> str:
     return (
-        f"【图说明】{model}（铁锂 24S，标称 37Ah）。横轴为 BMS 上报的累计循环次数（每 25 次为一档，取档中值）：\n"
+        f"【图说明】{model}（{desc or '铁锂 24S'}，标称 {c_nom:g}Ah）。横轴为 BMS 上报的累计循环次数（每 25 次为一档，取档中值）：\n"
         "把每台设备每月的 SOH 按其当时的累计循环归档后取中位数。与“月龄曲线”按时间对齐不同，本图按“用了多少循环”\n"
         "对齐，反映同等循环消耗下的容量保持能力，可剥离使用强度（换电频次）差异。\n"
         "实线=SOH 中位数，阴影带=P10~P90；虚线（右轴）=落入该循环档的设备数；点状竖线=中位 SOH 跌破 80% 的循环次数。\n"
@@ -239,7 +260,7 @@ def caption_single_loop(model: str) -> str:
     )
 
 
-_LOOP_COLORS = {"四美7237": "#d62728", "海池7237": "#1f77b4"}
+_LOOP_COLORS = {m: model_color(m) for m in _MODEL_ORDER}
 
 
 def _interp_at(x, y, target):
@@ -284,14 +305,36 @@ def _add_loop_xaxis(ax, series: list[tuple], title: str) -> None:
     ax_top.tick_params(axis="x", pad=2)
 
 
-def _mark_soh80(ax, x, soh_pct, loops, color, fmt) -> None:
-    """标注中位 SOH 首次跌破 80% 的位置：竖线 + 文字（支持两行，自动避让边界）。"""
+def _mark_soh80(ax, x, soh_pct, loops, color, fmt, below=None, above=None) -> None:
+    """标注中位 SOH 首次跌破 80% 的位置：竖线 + 文字（支持两行，自动避让边界）。
+
+    below=(x_axes, y_axes)：文字框放到图内底部指定位置，箭头指回 (xc, 80) 交点。
+    above=dy_axes：文字框放到 80% 虚线上方（横坐标同交点），箭头向下指回交点；
+    多型号合图用不同 dy 错开三档，防重叠。
+    """
     xc = _interp_at(x, soh_pct, 80.0)
     if xc is None:
         return
     loop_at = float(np.interp(xc, np.asarray(x, dtype=float),
                               np.asarray(loops, dtype=float))) if loops is not None else None
     ax.axvline(xc, color=color, ls=":", lw=1.4, alpha=0.9)
+    if above is not None:
+        # 文字框放图表最上方（横坐标同交点，落在竖线顶端），颜色一致无需箭头
+        from matplotlib.transforms import blended_transform_factory
+        trans = blended_transform_factory(ax.transData, ax.transAxes)
+        ax.annotate(fmt(xc, loop_at), xy=(xc, above), xycoords=trans,
+                    fontsize=8.5, color=color, weight="bold", ha="center", va="top",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.92))
+        return
+    if below is not None:
+        ax.annotate(fmt(xc, loop_at), xy=(xc, 80), xycoords="data",
+                    xytext=below, textcoords="axes fraction",
+                    arrowprops=dict(arrowstyle="->", color=color, lw=1.2,
+                                    shrinkA=4, shrinkB=4,
+                                    connectionstyle="arc3,rad=0.15"),
+                    fontsize=8.5, color=color, weight="bold", ha="center",
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.92))
+        return
     xlim = ax.get_xlim()
     near_right = xc > xlim[0] + 0.72 * (xlim[1] - xlim[0])
     ax.annotate(fmt(xc, loop_at), xy=(xc, 80),
@@ -311,20 +354,21 @@ def _fmt_mi(mi):
 
 def _set_age_dist_ticks(ax, dist: list) -> None:
     """月龄图横轴：每 2 个月一个刻度；主刻度（合图每 6、单型号每 3 个月）下加
-    分布行——每型号两行（累计循环次数 P25~P75、出厂年月 P25~P75），
-    合图共四行：一二行四美、三四行海池。dist: [(short, x, lp25, lp75, bp25, bp75)]"""
+    分布行——每型号两行（累计循环次数 P25~P75、出厂年月 P25~P75）。
+    型号超过 2 个时分布行太挤，只标数值。dist: [(short, x, lp25, lp75, bp25, bp75)]"""
     if not dist:
         return
     lo = max(float(min(d[1].min() for d in dist)), 0)
     hi = float(max(d[1].max() for d in dist))
     major = 6 if len(dist) > 1 else 3
+    show_rows = len(dist) <= 2
     dist = sorted(dist, key=lambda d: d[0])  # 四美行在前、海池行在后
     xt = [v for v in range(0, int(hi) + 1, 2) if v >= lo - 0.5]
     if not xt:
         return
     labs = []
     for v in xt:
-        if v % major != 0:  # 次刻度只标数值
+        if (v % major != 0) or not show_rows:  # 次刻度只标数值
             labs.append(str(v))
             continue
         rows = []
@@ -341,21 +385,24 @@ def _set_age_dist_ticks(ax, dist: list) -> None:
     ax.set_xticklabels(labs, fontsize=6)
 
 
-def _set_loop_dist_ticks(ax, dist: list) -> None:
+def _set_loop_dist_ticks(ax, dist: list, cap: float | None = None) -> None:
     """循环图横轴：每 50 次一个刻度；主刻度（每 100 次）下加分布行——每型号两行
     （月龄 P25~P75、出厂年月 P25~P75），合图共四行：一二行四美、三四行海池。
-    dist: [(short, x, a25, a75, bp25, bp75)]"""
+    dist: [(short, x, a25, a75, bp25, bp75)]；cap：横轴显示上限（超出尾部截断）。"""
     if not dist:
         return
     lo = max(float(min(d[1].min() for d in dist)), 0)
     hi = float(max(d[1].max() for d in dist))
+    if cap is not None:
+        hi = min(hi, cap)
+    show_rows = len(dist) <= 2
     dist = sorted(dist, key=lambda d: d[0])  # 四美行在前、海池行在后
-    xt = [v for v in range(50, int(hi) + 51, 50) if v >= lo]
+    xt = [v for v in range(50, int(hi) + 51, 50) if v >= lo and (cap is None or v <= cap)]
     if not xt:
         return
     labs = []
     for v in xt:
-        if v % 100 != 0:  # 次刻度只标数值
+        if (v % 100 != 0) or not show_rows:  # 次刻度只标数值
             labs.append(str(v))
             continue
         rows = []
@@ -383,11 +430,10 @@ def plot_age_trend(trend: pl.DataFrame, path: str) -> None:
 
     fig, ax = plt.subplots(figsize=(11, 8))
     ax2 = ax.twinx()  # 右轴：各月龄点参与统计的设备数
-    colors = {"四美7237": "#d62728", "海池7237": "#1f77b4"}
     mark_series, dist = [], []
     for (model,), sub in trend.group_by("电池型号", maintain_order=True):
         sub = sub.sort("age_month")
-        c = colors.get(str(model), "gray")
+        c = model_color(model)
         x = sub["age_month"].to_numpy()
         ax.plot(x, sub["soh_median"] * 100, "-o", ms=3, color=c, label=f"{model} 中位")
         ax.fill_between(x, sub["soh_p10"] * 100, sub["soh_p90"] * 100, color=c, alpha=0.12,
@@ -405,22 +451,27 @@ def plot_age_trend(trend: pl.DataFrame, path: str) -> None:
                 ax2.annotate(f"{int(n)}", (xi, n), textcoords="offset points",
                              xytext=(0, 6), fontsize=7, color=c, ha="center")
     ax.axhline(80, color="k", ls="--", lw=1, label="退役线 80%")
-    for m, x, soh, c in mark_series:  # 中位 SOH 跌破 80% 的月龄
-        _mark_soh80(ax, x, soh, None, c,
-                    lambda xc, la, m=m: f"{m} 80%@{xc:.1f}月龄")
+    cross80 = [(m, _interp_at(x, soh, 80.0), c, x, soh) for m, x, soh, c in mark_series]
+    cross80 = [(m, xc, c, x, soh) for m, xc, c, x, soh in cross80 if xc is not None]
+    cross80.sort(key=lambda t: t[1])
+    for i, (m, xc, c, x_all, soh_all) in enumerate(cross80):  # 80% 交点：图顶部竖线上方三档
+        _mark_soh80(ax, x_all, soh_all, None, c,
+                    lambda xcv, la, m=m: f"{m} 80%@{xcv:.1f}月龄",
+                    above=0.985 - 0.105 * (i % 3))
     _set_age_dist_ticks(ax, dist)
     ax.set_ylabel("SOH (%)")
     ax2.set_ylabel("设备数（台）")
-    ax.set_xlabel("上线月龄（月）｜刻度下四行：一二行四美、三四行海池"
-                  "（循环次数 P25~P75 ／ 出厂年月 P25~P75）",
-                  labelpad=48)
+    ax.set_xlabel("上线月龄（月）" + ("｜刻度下四行：一二行四美、三四行海池"
+                  "（循环次数 P25~P75 ／ 出厂年月 P25~P75）" if len(dist) <= 2 else ""),
+                  labelpad=48 if len(dist) <= 2 else 8)
     ax.set_title("分型号 SOH-月龄曲线（同起点时间轴对齐，消除出厂/上线时间差）")
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=2, loc="lower left")
     ax.grid(alpha=0.3)
-    _add_caption(fig, caption_age(), y=0.205)
-    fig.tight_layout(rect=[0, 0.215, 1, 0.955])
+    fig.legend(h1 + h2, l1 + l2, fontsize=7.5, ncol=6, loc="upper center",
+               bbox_to_anchor=(0.5, 0.245), framealpha=0.9)
+    _add_caption(fig, caption_age(), y=0.145)
+    fig.tight_layout(rect=[0, 0.27, 1, 0.955])
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
@@ -437,12 +488,11 @@ def plot_trend(trend: pl.DataFrame, path: str) -> None:
 
     fig, ax = plt.subplots(figsize=(11, 8))
     ax2 = ax.twinx()  # 右轴：各月参与统计的设备数
-    colors = {"四美7237": "#d62728", "海池7237": "#1f77b4"}
     loop_series = []
     for (model,), sub in trend.group_by("电池型号", maintain_order=True):
         sub = sub.sort("ym")
         x = mdates.date2num(sub["ym"].str.to_datetime(format="%Y-%m").to_numpy())
-        c = colors.get(str(model), "gray")
+        c = model_color(model)
         ax.plot(x, sub["soh_median"] * 100, "-o", ms=3, color=c, label=f"{model} 中位")
         ax.fill_between(x, sub["soh_p10"] * 100, sub["soh_p90"] * 100, color=c, alpha=0.12,
                         label=f"{model} P10~P90")
@@ -464,23 +514,25 @@ def plot_trend(trend: pl.DataFrame, path: str) -> None:
     ax.set_title("分型号 SOH 月度趋势（锚点法，中位数与 P10~P90 区间）")
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    # 图例放中左侧空白区（SOH 曲线在上、设备数曲线在下，避免遮挡）
-    ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=2, loc="center left", framealpha=0.9)
+    # 图例移到图表下方（避免遮挡曲线）
     ax.grid(alpha=0.3)
+    fig.legend(h1 + h2, l1 + l2, fontsize=7.5, ncol=6, loc="upper center",
+               bbox_to_anchor=(0.5, 0.245), framealpha=0.9)
     # X 轴刻度显示为 年-月（否则显示 matplotlib 内部日期序列数）
     ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    _add_caption(fig, caption_trend(), y=0.183)
-    fig.tight_layout(rect=[0, 0.19, 1, 0.955])
+    _add_caption(fig, caption_trend(), y=0.145)
+    fig.tight_layout(rect=[0, 0.27, 1, 0.955])
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
 def _model_color(model: str) -> str:
-    return {"四美7237": "#d62728", "海池7237": "#1f77b4"}.get(model, "gray")
+    return model_color(model)
 
 
-def plot_single_trend(trend: pl.DataFrame, model: str, path: str) -> None:
+def plot_single_trend(trend: pl.DataFrame, model: str, path: str,
+                      desc: str = "", c_nom: float = 37.0) -> None:
     """单型号日历月趋势图（与 plot_trend 同标准，仅一个型号）。"""
     import matplotlib
 
@@ -522,13 +574,14 @@ def plot_single_trend(trend: pl.DataFrame, model: str, path: str) -> None:
     ax.grid(alpha=0.3)
     ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-    _add_caption(fig, caption_single_trend(model), y=0.183)
+    _add_caption(fig, caption_single_trend(model, desc, c_nom), y=0.183)
     fig.tight_layout(rect=[0, 0.19, 1, 0.955])
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
-def plot_single_age(age_trend: pl.DataFrame, model: str, path: str) -> None:
+def plot_single_age(age_trend: pl.DataFrame, model: str, path: str,
+                    desc: str = "", c_nom: float = 37.0) -> None:
     """单型号 SOH-月龄曲线（与 plot_age_trend 同标准，仅一个型号）。"""
     import matplotlib
 
@@ -568,7 +621,7 @@ def plot_single_age(age_trend: pl.DataFrame, model: str, path: str) -> None:
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=2, loc="lower left")
     ax.grid(alpha=0.3)
-    _add_caption(fig, caption_single_age(model), y=0.183)
+    _add_caption(fig, caption_single_age(model, desc, c_nom), y=0.183)
     fig.tight_layout(rect=[0, 0.19, 1, 0.955])
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -586,11 +639,10 @@ def plot_loop_trend(loop_trend: pl.DataFrame, path: str) -> None:
 
     fig, ax = plt.subplots(figsize=(11, 8))
     ax2 = ax.twinx()
-    colors = {"四美7237": "#d62728", "海池7237": "#1f77b4"}
     marks, dist = [], []
     for (model,), sub in loop_trend.group_by("电池型号", maintain_order=True):
         sub = sub.sort("loop_bin")
-        c = colors.get(str(model), "gray")
+        c = model_color(model)
         x = (sub["loop_from"] + sub["loop_to"]) / 2.0
         ax.plot(x, sub["soh_median"] * 100, "-o", ms=3, color=c, label=f"{model} 中位")
         ax.fill_between(x, sub["soh_p10"] * 100, sub["soh_p90"] * 100, color=c, alpha=0.12,
@@ -607,27 +659,47 @@ def plot_loop_trend(loop_trend: pl.DataFrame, path: str) -> None:
                 ax2.annotate(f"{int(n)}", (xi, n), textcoords="offset points",
                              xytext=(0, 6), fontsize=7, color=c, ha="center")
     ax.axhline(80, color="k", ls="--", lw=1, label="退役线 80%")
-    for m, x, soh, c in marks:  # 中位 SOH 跌破 80% 的循环次数
-        _mark_soh80(ax, x, soh, None, c,
-                    lambda xc, la, m=m: f"{m} 80%@{xc:.0f}次")
-    _set_loop_dist_ticks(ax, dist)
+    # 横轴截断：按设备数加权 98% 分位（不低于 800 次），防止个别高循环尾部压缩整体布局
+    cap = None
+    tot = int(loop_trend["device_count"].sum())
+    if tot > 0:
+        s = (loop_trend.sort("loop_to").with_columns(
+            (pl.col("device_count").cum_sum() / tot).alias("_cc"))
+            .filter(pl.col("_cc") <= 0.98))
+        if s.height:
+            cap = max(800.0, (float(s["loop_to"].max()) // 50 + 1) * 50)
+            ax.set_xlim(0, cap)
+    # 80% 交点说明：文字框放 80% 虚线上方（横坐标同交点），箭头向下指回交点，三档错开防重叠
+    cross80 = [(m, _interp_at(x, soh, 80.0), c, x, soh) for m, x, soh, c in marks]
+    cross80 = [(m, xc, c, x, soh) for m, xc, c, x, soh in cross80 if xc is not None]
+    cross80.sort(key=lambda t: t[1])
+    for i, (m, xc, c, x_all, soh_all) in enumerate(cross80):
+        _mark_soh80(ax, x_all, soh_all, None, c,
+                    lambda xcv, la, m=m: f"{m} 80%@{xcv:.0f}次",
+                    above=0.985 - 0.105 * (i % 3))
+    _set_loop_dist_ticks(ax, dist, cap)
     ax.set_ylabel("SOH (%)")
     ax2.set_ylabel("设备数（台）")
-    ax.set_xlabel("BMS 累计循环次数（次，25 次一档）｜刻度下四行：一二行四美、三四行海池"
-                  "（月龄 P25~P75 ／ 出厂年月 P25~P75）",
-                  labelpad=48)
+    ax.set_xlabel("BMS 累计循环次数（次，25 次一档）"
+                  + (f"｜横轴截断至 {cap:.0f} 次（尾部少量设备未显示）" if cap else "")
+                  + ("｜刻度下四行：一二行四美、三四行海池"
+                     "（月龄 P25~P75 ／ 出厂年月 P25~P75）" if len(dist) <= 2 else ""),
+                  labelpad=48 if len(dist) <= 2 else 8)
     ax.set_title("分型号 SOH-循环次数曲线（以累计循环为横轴，消除使用强度差异）")
     h1, l1 = ax.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=2, loc="lower left", framealpha=0.9)
     ax.grid(alpha=0.3)
-    _add_caption(fig, caption_loop(), y=0.183)
-    fig.tight_layout(rect=[0, 0.19, 1, 1])
+    # 图例移到图表下方（避免遮挡曲线）
+    fig.legend(h1 + h2, l1 + l2, fontsize=7.5, ncol=6, loc="upper center",
+               bbox_to_anchor=(0.5, 0.245), framealpha=0.9)
+    _add_caption(fig, caption_loop(), y=0.145)
+    fig.tight_layout(rect=[0, 0.27, 1, 1])
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
-def plot_single_loop(loop_trend: pl.DataFrame, model: str, path: str) -> None:
+def plot_single_loop(loop_trend: pl.DataFrame, model: str, path: str,
+                     desc: str = "", c_nom: float = 37.0) -> None:
     """单型号 SOH-循环次数曲线（与 plot_loop_trend 同标准，仅一个型号）。"""
     import matplotlib
 
@@ -667,15 +739,25 @@ def plot_single_loop(loop_trend: pl.DataFrame, model: str, path: str) -> None:
     h2, l2 = ax2.get_legend_handles_labels()
     ax.legend(h1 + h2, l1 + l2, fontsize=8, ncol=2, loc="lower left", framealpha=0.9)
     ax.grid(alpha=0.3)
-    _add_caption(fig, caption_single_loop(model), y=0.183)
+    _add_caption(fig, caption_single_loop(model, desc, c_nom), y=0.183)
     fig.tight_layout(rect=[0, 0.19, 1, 0.955])
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
 
+def model_desc(model: str, cfg: Config) -> tuple[str, float]:
+    """型号 → (体系描述如 '铁锂 24S', 标称容量 Ah)。缺参数回退 ('', 37)。"""
+    mp = (cfg.model_params or {}).get(str(model))
+    if not mp:
+        return "", float(cfg.get("c_nom_spec") or C_NOM_SPEC_FALLBACK)
+    chem = "铁锂" if mp.get("chemistry") == "LFP" else "三元"
+    return f"{chem} {mp.get('series', '?')}S", float(mp.get("c_nom_spec", 37.0))
+
+
 def run(cfg: Config) -> dict:
-    out = os.path.join(OUTPUT_DIR, "reports")
-    os.makedirs(out, exist_ok=True)
+    root = os.path.join(OUTPUT_DIR, "reports")
+    total_dir = os.path.join(root, "总体")
+    os.makedirs(total_dir, exist_ok=True)
     model_map = cfg.model_map
     if model_map is None:
         print("[report_model] 未配置 device_filter 或缺少 电池型号 列，跳过")
@@ -686,44 +768,62 @@ def run(cfg: Config) -> dict:
     trend = model_trend(analysis, model_map, c_nom_spec)
     decay = model_decay(analysis, model_map)
     age_trend = model_age_trend(analysis, model_map, c_nom_spec)
-    trend.write_csv(os.path.join(out, "model_trend.csv"))
-    decay.write_csv(os.path.join(out, "model_decay_stats.csv"))
-    age_trend.write_csv(os.path.join(out, "model_age_trend.csv"))
+    trend.write_csv(os.path.join(total_dir, "model_trend.csv"))
+    decay.write_csv(os.path.join(total_dir, "model_decay_stats.csv"))
+    age_trend.write_csv(os.path.join(total_dir, "model_age_trend.csv"))
     # 循环次数维度（需月聚合含 loop 列）
     loop_trend = stage_loops = None
     if "loop_median" in analysis.columns:
         loop_trend = model_loop_trend(analysis, model_map, c_nom_spec)
-        loop_trend.write_csv(os.path.join(out, "model_loop_trend.csv"))
+        loop_trend.write_csv(os.path.join(total_dir, "model_loop_trend.csv"))
         ret_path = os.path.join(OUTPUT_DIR, "retirement", "retirement_forecast.parquet")
         if os.path.exists(ret_path):
             stage_loops = model_stage_loops(analysis, model_map, pl.read_parquet(ret_path))
-            stage_loops.write_csv(os.path.join(out, "model_stage_loops.csv"))
-    single_pngs = []
+            stage_loops.write_csv(os.path.join(total_dir, "model_stage_loops.csv"))
+
+    models = sorted(str(m) for m in trend["电池型号"].unique().to_list())
+    pngs: dict[str, dict] = {}  # model -> {trend/age/loop png 路径}
     try:
-        plot_trend(trend, os.path.join(out, "model_soh_trend.png"))
-        png = os.path.join(out, "model_soh_trend.png")
-        plot_age_trend(age_trend, os.path.join(out, "model_soh_age_trend.png"))
-        age_png = os.path.join(out, "model_soh_age_trend.png")
-        for model in trend["电池型号"].unique().to_list():
-            safe = str(model).replace("/", "_")
-            p1 = os.path.join(out, f"model_soh_trend_{safe}.png")
-            p2 = os.path.join(out, f"model_soh_age_trend_{safe}.png")
-            plot_single_trend(trend, str(model), p1)
-            plot_single_age(age_trend, str(model), p2)
-            single_pngs += [p1, p2]
-            if loop_trend is not None and loop_trend.height:
-                p4 = os.path.join(out, f"model_soh_loop_trend_{safe}.png")
-                plot_single_loop(loop_trend, str(model), p4)
-                single_pngs.append(p4)
+        png = os.path.join(total_dir, "model_soh_trend.png")
+        plot_trend(trend, png)
+        age_png = os.path.join(total_dir, "model_soh_age_trend.png")
+        plot_age_trend(age_trend, age_png)
+        loop_png = None
         if loop_trend is not None and loop_trend.height:
-            p3 = os.path.join(out, "model_soh_loop_trend.png")
-            plot_loop_trend(loop_trend, p3)
-            single_pngs.append(p3)
+            loop_png = os.path.join(total_dir, "model_soh_loop_trend.png")
+            plot_loop_trend(loop_trend, loop_png)
+        for model in models:
+            safe = model.replace("/", "_")
+            mdir = os.path.join(root, safe)
+            os.makedirs(mdir, exist_ok=True)
+            desc, c_nom = model_desc(model, cfg)
+            sub_trend = trend.filter(pl.col("电池型号") == model)
+            sub_age = age_trend.filter(pl.col("电池型号") == model)
+            sub_trend.write_csv(os.path.join(mdir, "model_trend.csv"))
+            sub_age.write_csv(os.path.join(mdir, "model_age_trend.csv"))
+            decay.filter(pl.col("电池型号") == model).write_csv(
+                os.path.join(mdir, "model_decay_stats.csv"))
+            if stage_loops is not None:
+                stage_loops.filter(pl.col("电池型号") == model).write_csv(
+                    os.path.join(mdir, "model_stage_loops.csv"))
+            p1 = os.path.join(mdir, "model_soh_trend.png")
+            p2 = os.path.join(mdir, "model_soh_age_trend.png")
+            plot_single_trend(trend, model, p1, desc=desc, c_nom=c_nom)
+            plot_single_age(age_trend, model, p2, desc=desc, c_nom=c_nom)
+            entry = {"trend": p1, "age": p2}
+            if loop_trend is not None and loop_trend.height:
+                sub_loop = loop_trend.filter(pl.col("电池型号") == model)
+                sub_loop.write_csv(os.path.join(mdir, "model_loop_trend.csv"))
+                p4 = os.path.join(mdir, "model_soh_loop_trend.png")
+                plot_single_loop(loop_trend, model, p4, desc=desc, c_nom=c_nom)
+                entry["loop"] = p4
+            pngs[model] = entry
     except Exception as e:  # 无显示环境等
         print(f"[report_model] 绘图跳过: {e}")
-        png = age_png = None
+        png = age_png = loop_png = None
     print(f"[report_model] 型号趋势 {trend.height} 行（型号×月），"
-          f"月龄趋势 {age_trend.height} 行（型号×月龄），标称 {c_nom_spec}Ah")
+          f"月龄趋势 {age_trend.height} 行（型号×月龄），型号 {len(models)} 个")
     return {"trend": trend, "decay": decay, "age_trend": age_trend,
             "loop_trend": loop_trend, "stage_loops": stage_loops,
-            "png": png, "age_png": age_png, "single_pngs": single_pngs}
+            "png": png, "age_png": age_png, "loop_png": loop_png,
+            "models": models, "model_pngs": pngs}

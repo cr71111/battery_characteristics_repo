@@ -63,13 +63,21 @@ def pava_decreasing(y: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
 def run(monthly: pl.DataFrame, cfg: Config) -> pl.DataFrame:
     win = cfg.get("soh.mad_window")
     k = cfg.get("soh.mad_threshold")
-    c_nom_spec = float(cfg.get("c_nom_spec") or 37.0)  # 绝对口径分母
+    fallback = float(cfg.get("c_nom_spec") or 37.0)
+    # 逐型号标称容量分母（绝对口径）；无型号列/缺参数时回退全局 c_nom_spec
+    model_params = cfg.model_params
     low = float(cfg.get("exclude.soh_low_ratio") or 0.90)
 
+    has_model = "电池型号" in monthly.columns
     out_chunks = []
     n_trimmed = 0
     for (ch, dev), sub in monthly.group_by(["渠道号", "电池id"], maintain_order=True):
         sub = sub.sort("ym")
+        c_nom_spec = fallback
+        if has_model:
+            mp = model_params.get(str(sub["电池型号"][0]))
+            if mp:
+                c_nom_spec = float(mp["c_nom_spec"])
         cap = sub["capacity_median"].to_numpy()
         # 6-pre 前导异常月剔除：头 k 个月 SOH < low 而后续中位 >= low →
         # 初期校准噪声（换BMS新ID首月偏低、次月恢复），在平滑前删除，

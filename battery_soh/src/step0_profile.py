@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 
@@ -22,6 +23,8 @@ from .io import scan_raw
 
 SERIES_CANDIDATES = {"LFP": [24, 25], "NMC": [20, 21]}
 PLATFORM_SLOPE_LFP_MAX = 0.03  # V/cell 每单位 SOC；平台区低于此 → LFP
+# 0.2~0.8 全窗平均斜率（含两端拐点）的判别阈值，V/cell：实测 LFP≈0.13~0.15、NMC≈0.65
+WINDOW_SLOPE_LFP_MAX_CELLS = 0.35
 SAMPLE_MOD = 25  # 设备抽样：电池id % 25 == 0（约 4%）
 
 
@@ -65,43 +68,115 @@ def _r_stats(lf: pl.LazyFrame) -> dict:
     }, st
 
 
+def _infer_series(vmax: float, vmin: float) -> tuple[str, int]:
+    """由满充/放空电压推断（体系, 串数）：候选串数取误差最小者。"""
+    best, best_err = None, 1e9
+    for chem, (vf, vc) in (("LFP", (3.65, 2.60)), ("NMC", (4.20, 3.00))):
+        for s in (16, 17, 20, 21, 24, 25):
+            err = abs(vmax / s - vf) + abs(vmin / s - vc)
+            if err < best_err:
+                best, best_err = (chem, s), err
+    return best
+
+
 def _chemistry(lf: pl.LazyFrame) -> dict:
-    """2. 体系判别：平台区 dV/dSOC 斜率（长平台=LFP，单调斜线=NMC）+ 串数。"""
+    """2. 体系判别：平台区 dV/dSOC 斜率（长平台=LFP，单调斜线=NMC）+ 串数。
+
+    多型号混合数据下 pack 斜率不可直接比较，须按各设备推断串数折算为 V/cell。
+    """
     d = _collect(
         _sampled(lf)
         .filter((pl.col("SOC") >= 0.2) & (pl.col("SOC") <= 0.8) & pl.col("电流").abs().lt(1.0))
         .select(["电池id", "SOC", "电压"])
     )
-    slopes = []
-    for (dev,), sub in d.group_by("电池id", maintain_order=True):
-        if sub.height < 50:
-            continue
-        slopes.append(float(np.polyfit(sub["SOC"], sub["电压"], 1)[0]))
-    med_slope = float(np.median(slopes)) if slopes else 0.0
-    chem = "LFP" if med_slope < PLATFORM_SLOPE_LFP_MAX * 25 else "NMC"
-    # 串数：满充电压/单体满充、放空电压/单体截止 取最接近的候选串数
     lim = _collect(
         _sampled(lf)
         .group_by("电池id")
         .agg(pl.col("电压").max().alias("vmax"), pl.col("电压").min().alias("vmin"))
     )
-    cell = {"LFP": (3.65, 2.60), "NMC": (4.20, 3.00)}[chem]
+    ser_map = {
+        int(r["电池id"]): _infer_series(float(r["vmax"]), float(r["vmin"]))
+        for r in lim.iter_rows(named=True)
+    }
+    per_cell = []
+    for (dev,), sub in d.group_by("电池id", maintain_order=True):
+        if sub.height < 50:
+            continue
+        cs = ser_map.get(int(dev))
+        if cs is None:
+            continue
+        per_cell.append(float(np.polyfit(sub["SOC"], sub["电压"], 1)[0]) / cs[1])
+    med_slope = float(np.median(per_cell)) if per_cell else 0.0
+    chem = "LFP" if med_slope < WINDOW_SLOPE_LFP_MAX_CELLS else "NMC"
+    # 串数：满充电压/单体满充、放空电压/单体截止 取最接近的候选串数
+    vmed, vp05 = float(lim["vmax"].median()), float(lim["vmin"].quantile(0.05))
     best, best_err = None, 1e9
     for s in SERIES_CANDIDATES[chem]:
-        e_full = abs(float(lim["vmax"].median()) / s - cell[0])
-        e_cut = abs(float(lim["vmin"].quantile(0.05)) / s - cell[1])
-        err = e_full + e_cut
+        cell = {"LFP": (3.65, 2.60), "NMC": (4.20, 3.00)}[chem]
+        err = abs(vmed / s - cell[0]) + abs(vp05 / s - cell[1])
         if err < best_err:
             best, best_err = s, err
     return {
-        "platform_slope_v_per_soc": round(med_slope, 3),
+        "platform_slope_v_per_cell": round(med_slope, 4),
         "chemistry": chem,
         "series": best,
-        "cell_v_full": cell[0],
-        "cell_v_cutoff": cell[1],
-        "pack_vmax_median": round(float(lim["vmax"].median()), 2),
-        "pack_vmin_p05": round(float(lim["vmin"].quantile(0.05)), 2),
+        "cell_v_full": {"LFP": 3.65, "NMC": 4.20}[chem],
+        "cell_v_cutoff": {"LFP": 2.60, "NMC": 3.00}[chem],
+        "pack_vmax_median": round(vmed, 2),
+        "pack_vmin_p05": round(vp05, 2),
     }
+
+
+def _verify_models(lf: pl.LazyFrame, cfg: Config) -> dict:
+    """多型号模式：逐型号抽样判别体系/串数，与 电池参数.csv 比对（CSV 优先）。
+
+    返回 {型号: {declared, measured, ok}}；不一致打印告警但不阻断（以 CSV 为准）。
+    """
+    mm = cfg.model_map
+    params = cfg.model_params
+    if mm is None or not params:
+        return {}
+    d = _collect(
+        _sampled(lf.join(mm.lazy(), on="电池id", how="inner"))
+        .filter((pl.col("SOC") >= 0.2) & (pl.col("SOC") <= 0.8) & pl.col("电流").abs().lt(1.0))
+        .select(["电池id", "电池型号", "SOC", "电压", "更新时间"])
+    )
+    by_model: dict[str, dict] = {}
+    for (model,), sub in d.group_by("电池型号", maintain_order=True):
+        declared = params.get(str(model), {})
+        s_decl = int(declared.get("series") or 0) or None
+        slopes = []
+        for (_dev,), s2 in sub.group_by("电池id", maintain_order=True):
+            if s2.height < 50:
+                continue
+            slopes.append(float(np.polyfit(s2["SOC"], s2["电压"], 1)[0]))
+        med_slope = float(np.median(slopes)) if slopes else 0.0
+        # 按参数表声明串数折算为 V/cell 再判别体系（多串数体系不可直接比 pack 斜率）
+        per_cell = med_slope / s_decl if s_decl else med_slope
+        chem = "LFP" if per_cell < WINDOW_SLOPE_LFP_MAX_CELLS else "NMC"
+        lim = sub.group_by("电池id").agg(pl.col("电压").max().alias("vmax"),
+                                         pl.col("电压").min().alias("vmin"))
+        cell = {"LFP": (3.65, 2.60), "NMC": (4.20, 3.00)}[chem]
+        best, best_err = None, 1e9
+        for s in (16, 17, 20, 21, 24, 25):
+            e_full = abs(float(lim["vmax"].median()) / s - cell[0])
+            e_cut = abs(float(lim["vmin"].quantile(0.05)) / s - cell[1])
+            err = e_full + e_cut
+            if err < best_err:
+                best, best_err = s, err
+        ok = (declared.get("chemistry") == chem
+              and declared.get("series") == best)
+        if not ok:
+            print(f"[step0] 告警：型号 {model} 实测体系 {chem}/{best}S 与参数表 "
+                  f"{declared.get('chemistry')}/{declared.get('series')}S 不一致，以参数表为准")
+        by_model[str(model)] = {
+            "declared": {k: declared.get(k) for k in ("chemistry", "series", "c_nom_spec")},
+            "measured": {"chemistry": chem, "series": best,
+                         "platform_slope_v_per_soc": round(med_slope, 3),
+                         "platform_slope_v_per_cell": round(per_cell, 4)},
+            "ok": ok,
+        }
+    return by_model
 
 
 def _sampling(lf: pl.LazyFrame) -> dict:
@@ -172,6 +247,7 @@ def _c_nom(lf: pl.LazyFrame) -> pl.DataFrame:
     """4 章 P04：C_nom_BMS = 设备级 R 众数（0.5Ah 分箱取最密箱中值），非规格书猜测。
 
     全量设备（streaming 聚合，供 Step 3 join）。
+    亿级行下避免 sort：用 arg_max 聚合取最密箱；span 单独 collect 后内存 join。
     """
     df = (
         lf.filter((pl.col("SOC") > 0.05) & (pl.col("剩余容量") > 0))
@@ -181,18 +257,19 @@ def _c_nom(lf: pl.LazyFrame) -> pl.DataFrame:
         .with_columns((pl.col("R") / 0.5).floor().mul(0.5).alias("rb"))
         .group_by(["渠道号", "电池id", "rb"])
         .agg(pl.len().alias("cnt"))
-        .sort(["渠道号", "电池id", "cnt"], descending=[False, False, True])
-        .group_by(["渠道号", "电池id"], maintain_order=True)
+        .group_by(["渠道号", "电池id"])
         .agg(
-            (pl.col("rb").first() + 0.25).alias("c_nom_bms"),
+            (pl.col("rb").get(pl.col("cnt").arg_max()) + 0.25).alias("c_nom_bms"),
             pl.col("cnt").sum().alias("n_rows"),
         )
+        .collect(engine="streaming")
     )
     span = (
         lf.group_by(["渠道号", "电池id"])
         .agg(pl.col("更新时间").min().alias("t0"), pl.col("更新时间").max().alias("t1"))
+        .collect(engine="streaming")
     )
-    return df.join(span, on=["渠道号", "电池id"], how="left").collect(engine="streaming")
+    return df.join(span, on=["渠道号", "电池id"], how="left")
 
 
 def _anchor_density(lf: pl.LazyFrame, v_full: float, v_cutoff: float) -> dict:
@@ -220,7 +297,11 @@ def run(cfg: Config, dry_run: bool = False) -> dict:
     lf = scan_raw(cfg.data_path)
 
     r_stats, r_tbl = _r_stats(lf)
+    gc.collect()
     chem = _chemistry(lf)
+    gc.collect()
+    model_check = _verify_models(lf, cfg)
+    gc.collect()
     sampling = _sampling(lf)
     loopnum = _loopnum(lf, cfg.get("selfcheck.neg_loopnum_frac"))
     sign = _current_sign(lf)
@@ -228,8 +309,10 @@ def run(cfg: Config, dry_run: bool = False) -> dict:
         lf, cfg.get("selfcheck.current_zero_frac_limit", 0.9),
         cfg.get("anchor.current_near_zero_a", 1.0),
     )
+    gc.collect()
     c_nom = _c_nom(lf)
     density = _anchor_density(lf, chem["series"] * chem["cell_v_full"], chem["series"] * chem["cell_v_cutoff"])
+    gc.collect()
 
     # 7. R_MODE 分支（v2.0 必须写进主流程，P06）
     dynamic = r_stats["median_cv"] >= cfg.get("selfcheck.r_cv_dynamic") or \
@@ -245,6 +328,7 @@ def run(cfg: Config, dry_run: bool = False) -> dict:
     report = {
         "r_validity": r_stats,
         "chemistry": chem,
+        "model_verification": model_check,
         "sampling": sampling,
         "loopnum": loopnum,
         "current_sign": sign,

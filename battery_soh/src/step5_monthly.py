@@ -75,6 +75,7 @@ def aggregate(df: pl.DataFrame, min_anchors: int = 3, anchor_mad_k: float = 3.0)
         # 循环次数（BMS 累计值）：月内中位/最大，用于 SOH-循环曲线
         loop_med = float(sub["循环次数"].median()) if "循环次数" in sub.columns and sub.height else None
         loop_max = float(sub["循环次数"].max()) if "循环次数" in sub.columns and sub.height else None
+        model = str(sub["电池型号"][0]) if "电池型号" in sub.columns else "unknown"
         out.append(
             (
                 ch, int(dev), int(y), int(m), f"{int(y)}-{int(m):02d}",
@@ -87,6 +88,7 @@ def aggregate(df: pl.DataFrame, min_anchors: int = 3, anchor_mad_k: float = 3.0)
                 soh_bms,
                 loop_med,
                 loop_max,
+                model,
             )
         )
     return pl.DataFrame(
@@ -96,7 +98,7 @@ def aggregate(df: pl.DataFrame, min_anchors: int = 3, anchor_mad_k: float = 3.0)
             "ym": pl.Utf8, "capacity_median": pl.Float64, "capacity_count": pl.Int64,
             "tier1_count": pl.Int64, "tier2_count": pl.Int64, "temp_mean": pl.Float64,
             "score_mean": pl.Float64, "soh_bms": pl.Float64,
-            "loop_median": pl.Float64, "loop_max": pl.Float64,
+            "loop_median": pl.Float64, "loop_max": pl.Float64, "电池型号": pl.Utf8,
         },
         orient="row",
     ).sort(["渠道号", "电池id", "ym"])

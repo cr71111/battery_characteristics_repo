@@ -48,6 +48,7 @@ def build_exclusions(soh_tbl: pl.DataFrame, cfg: Config) -> pl.DataFrame:
       前几月低、后面正常的已在 step6 平滑前删掉前导异常月）。
     """
     low = float(cfg.get("exclude.soh_low_ratio") or 0.90)
+    has_model = "电池型号" in soh_tbl.columns
     d = (
         soh_tbl.sort(["渠道号", "电池id", "ym"])
         .group_by(["渠道号", "电池id"])
@@ -63,6 +64,7 @@ def build_exclusions(soh_tbl: pl.DataFrame, cfg: Config) -> pl.DataFrame:
             pl.col("ym").first().alias("ym_first"),
             pl.col("ym").last().alias("ym_last"),
             pl.col("loop_median").first().alias("loop_first"),
+            *([pl.col("电池型号").first().alias("电池型号")] if has_model else []),
         )
         .with_columns(
             pl.col("_h2").list.get(1, null_on_oob=True).alias("soh_second_reliable"),
@@ -71,6 +73,7 @@ def build_exclusions(soh_tbl: pl.DataFrame, cfg: Config) -> pl.DataFrame:
         )
         .filter((pl.col("reliable_months") >= 2) & (pl.col("soh_max") < low))
         .select(
+            *(["电池型号"] if has_model else []),
             "渠道号", "电池id", "reliable_months", "soh_first_reliable",
             "soh_second_reliable", "spread_ratio", "loop_first",
             "ym_first", "ym_last", "reasons",
@@ -81,7 +84,7 @@ def build_exclusions(soh_tbl: pl.DataFrame, cfg: Config) -> pl.DataFrame:
 
 
 def run(soh_tbl: pl.DataFrame, anchors: pl.LazyFrame | pl.DataFrame, cfg: Config) -> dict:
-    out = os.path.join(OUTPUT_DIR, "reports")
+    out = os.path.join(OUTPUT_DIR, "reports", "总体")
     os.makedirs(out, exist_ok=True)
     soh_out = os.path.join(OUTPUT_DIR, "soh")
     os.makedirs(soh_out, exist_ok=True)
@@ -91,7 +94,7 @@ def run(soh_tbl: pl.DataFrame, anchors: pl.LazyFrame | pl.DataFrame, cfg: Config
     # 设备级剔除：仅疑似换BMS整台移除；其余保留（前导异常月已在 step6 处理）
     excl = build_exclusions(soh_tbl, cfg)
     excl.write_csv(os.path.join(out, "excluded_devices.csv"))
-    print(f"[step7] 剔除疑似换BMS设备 {excl.height} 台 → reports/excluded_devices.csv")
+    print(f"[step7] 剔除疑似换BMS设备 {excl.height} 台 → reports/总体/excluded_devices.csv")
     soh_tbl = soh_tbl.join(excl.select(["渠道号", "电池id"]), on=["渠道号", "电池id"],
                            how="anti", nulls_equal=True)
 

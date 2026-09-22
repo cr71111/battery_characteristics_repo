@@ -12,6 +12,12 @@ data_path: "data/filtered"
 # 设备过滤清单（只计算其中的电池id；留空则全量）
 device_filter: "device_model/device_model.csv"
 
+# 渠道号白名单（只保留这些渠道的设备数据；留空则不过滤）
+channels: [GYDS, JXHC, SMKJ]
+
+# 逐型号体系参数（电池类型/标称容量/串数/电压；优先于 Step 0 平台斜率判别）
+model_params_path: "device_model/电池参数.csv"
+
 # 设备标称容量（报告基准；管线内部仍用 Step 0 实测 C_nom，P04）
 c_nom_spec: 37.0
 

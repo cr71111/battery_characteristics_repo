@@ -45,8 +45,10 @@ def run(cfg: Config, force: bool = False) -> str:
     dm_path = cfg.device_filter_path
     if dm_path is None:
         raise FileNotFoundError("prep 需要 config.device_filter（电池id+电池型号清单）")
-    devs = pl.read_csv(dm_path)["电池id"].to_list()
-    print(f"[prep] 源文件 {len(files)} 个，目标设备 {len(devs)} 台", flush=True)
+    n_dev = pl.read_csv(dm_path)["电池id"].n_unique()
+    channels = cfg.channels
+    print(f"[prep] 源文件 {len(files)} 个，目标设备 {n_dev} 台"
+          + (f"，渠道白名单 {channels}" if channels else ""), flush=True)
 
     os.makedirs(out_dir, exist_ok=True)
     for p in part_paths(out_dir):
@@ -66,15 +68,24 @@ def run(cfg: Config, force: bool = False) -> str:
             writers[key].write_table(tbl)
             counts[key] = counts.get(key, 0) + sub.height
 
+    dev_list = sorted(set(pl.read_csv(dm_path)["电池id"].to_list()))
+    ch_list = list(channels) if channels else None
+    n_rows_in = 0
     for fi, f in enumerate(files):
-        (
-            pl.scan_parquet(f)
-            .filter(pl.col("电池id").is_in(devs))
-            .with_columns((pl.col("电池id") % N_PARTS).alias("_part"))
-            .sink_batches(_cb, chunk_size=1_000_000, maintain_order=False)
-        )
+        pf = pq.ParquetFile(f)
+        # 逐批流式读取：内存占用与文件大小无关；eager 过滤（避免流式引擎大内存物化）
+        for tbl in pf.iter_batches(batch_size=1_000_000):
+            n_rows_in += tbl.num_rows
+            b = pl.DataFrame(tbl)
+            b = b.filter(pl.col("电池id").is_in(dev_list))
+            if ch_list is not None:
+                b = b.filter(pl.col("渠道号").is_in(ch_list))
+            if b.height == 0:
+                continue
+            b = b.with_columns((pl.col("电池id") % N_PARTS).alias("_part"))
+            _cb(b)
         print(f"[prep] 源 {fi + 1}/{len(files)} 完成：{os.path.basename(f)}，"
-              f"累计 {sum(counts.values())} 行", flush=True)
+              f"累计 {sum(counts.values())} 行（读入 {n_rows_in}）", flush=True)
 
     for w in writers.values():
         w.close()

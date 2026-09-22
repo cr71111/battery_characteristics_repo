@@ -6,6 +6,7 @@ Reduce 阶段（Step 6~8）在月聚合层运行。
 """
 from __future__ import annotations
 
+import gc
 import glob
 import os
 import time
@@ -70,6 +71,12 @@ class Pipeline:
         os.makedirs(anchors_dir(), exist_ok=True)
         os.makedirs(os.path.join(MONTHLY_DIR, "parts"), exist_ok=True)
 
+        # 多型号：电池id→型号→体系参数（无参数表时退化为单型号全局 cfg）
+        model_map = self.cfg.model_map
+        model_params = self.cfg.model_params
+        id2model = (dict(zip(model_map["电池id"].to_list(), model_map["电池型号"].to_list()))
+                    if model_map is not None else {})
+
         monthly_chunks = []
         batch_idx = -1
         for part_i, part in enumerate(parts):
@@ -86,9 +93,25 @@ class Pipeline:
                 batch_idx += 1
                 devs = batch["电池id"].unique().to_list()
                 cleaned = step1_clean.run(batch, self.cfg)
-                anchored = step2_anchor.run(cleaned, self.cfg)
-                cap = step3_capacity.run(anchored, c_nom, self.cfg)
-                scored = step4_quality.run(cap, self.cfg)
+                if id2model:
+                    cleaned = cleaned.with_columns(
+                        pl.col("电池id").replace_strict(id2model).alias("电池型号"))
+                # 按型号分组跑体系相关步骤（step2/3/4）
+                scored_chunks = []
+                if model_params and "电池型号" in cleaned.columns:
+                    groups = [(str(sub["电池型号"][0]), sub)
+                              for sub in cleaned.partition_by("电池型号", maintain_order=True)]
+                else:
+                    groups = [("", cleaned)]
+                for mname, sub in groups:
+                    params = model_params.get(mname) if mname else None
+                    anchored = step2_anchor.run(sub, self.cfg, params=params)
+                    cap = step3_capacity.run(anchored, c_nom, self.cfg, params=params)
+                    scored = step4_quality.run(cap, self.cfg)
+                    if "电池型号" not in scored.columns:
+                        scored = scored.with_columns(pl.lit(mname or "unknown").alias("电池型号"))
+                    scored_chunks.append(scored)
+                scored = pl.concat(scored_chunks, how="vertical_relaxed")
                 monthly = step5_monthly.aggregate(
                     scored,
                     min_anchors=int(self.cfg.get("soh.min_anchors_per_month") or 3),
@@ -173,6 +196,11 @@ class Pipeline:
             if self.cfg.model_map is not None:
                 from . import report_model
                 report_model.run(self.cfg)
+                try:
+                    from . import report_interactive
+                    report_interactive.run(self.cfg)
+                except Exception as e:
+                    _log(f"[pipeline] 交互式 HTML 图表跳过: {e}")
                 try:
                     from . import report_forecast
                     report_forecast.run(self.cfg)
