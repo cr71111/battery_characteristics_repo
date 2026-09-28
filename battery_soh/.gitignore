@@ -12,10 +12,14 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# 数据文件（原始数据放 data/raw/，不入库；外部路径见 config/config.yaml data_path）
-data/raw/*.parquet
+# 数据文件（整个 data 目录不入库；外部路径见 config/config.yaml data_path）
+data/
 *.parquet
-!tests/data/*.parquet
+!tests/**/*.parquet
+
+# 运行日志
+*_log.txt
+run_err.txt
 
 # 临时
 _tmp_*
